@@ -1,0 +1,15 @@
+{
+    "manifest_version": 3,
+    "name": "ASX Data Scraper",
+    "version": "1.0",
+    "description": "Fetches Director Transactions from Market Index and saves to PostgreSQL.",
+    "permissions": ["storage", "activeTab", "scripting"],
+    "host_permissions": ["https://www.marketindex.com.au/asx/*"],
+    "background": {
+      "service_worker": "background.js"
+    },
+    "action": {
+      "default_popup": "popup.html"
+    }
+  }
+  

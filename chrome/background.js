@@ -13,15 +13,12 @@ chrome.storage.local.get(["maxTabs"], (data) => {
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.action === "start_scraping") {
         const newMaxTabs = message.maxTabs;
-
         if (!isRunning) {
-            // First time starting
             isRunning = true;
             currentMaxTabs = newMaxTabs;
             fetchTickersAndStartScraping();
             console.log(`✅ Scraping started with ${currentMaxTabs} tabs`);
         } else {
-            // Scraping is already running, adjust tabs
             currentMaxTabs = newMaxTabs;
             adjustTabs();
             console.log(`🔄 Adjusted to ${currentMaxTabs} tabs`);
@@ -32,23 +29,81 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     } else if (message.action === "resume_scraping") {
         isPaused = false;
         console.log("Scraping resumed.");
-        processTickerQueue(message.delay); // Resume processing only if needed
-    } 
-    // else if (message.action === "save_data") {
-    //     saveScrapedData(message.tickerSymbol, message.data);
-    // }
+        processTickerQueue(message.delay);
+    } else if (message.action === "save_data") {
+        saveScrapedData(message.tickerSymbol, message.data);
+    }
 });
 
 // Save scraped data to server
 async function saveScrapedData(tickerSymbol, data) {
     try {
-        const response = await fetch("http://127.0.0.1:5000/save_data", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ tickerSymbol, data })
-        });
-        const result = await response.json();
-        console.log(`✅ ${tickerSymbol} Data saved:`, result);
+        if (data.transactions && data.transactions.length > 0) {
+            const transactionResponse = await fetch("http://127.0.0.1:5000/save_data", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    tickerSymbol,
+                    type: "transactions",
+                    data: data.transactions
+                })
+            });
+            const transactionResult = await transactionResponse.json();
+            console.log(`✅ ${tickerSymbol} Transactions saved:`, transactionResult);
+        }
+
+        if (data.director_interests && data.director_interests.length > 0) {
+            const interestsResponse = await fetch("http://127.0.0.1:5000/save_data", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    tickerSymbol,
+                    type: "director_interests",
+                    data: data.director_interests
+                })
+            });
+            const interestsResult = await interestsResponse.json();
+            console.log(`✅ ${tickerSymbol} Director Interests saved:`, interestsResult);
+        }
+
+        if (data.historical_download_url) {
+            console.log(`📥 Downloading historical data for ${tickerSymbol} from ${data.historical_download_url}`);
+            const downloadId = await new Promise((resolve) => {
+                chrome.downloads.download({
+                    url: data.historical_download_url,
+                    filename: `${tickerSymbol}_historical.csv`,
+                    saveAs: false,
+                    conflictAction: "overwrite"
+                }, resolve);
+            });
+
+            const downloadItem = await new Promise((resolve) => {
+                chrome.downloads.onChanged.addListener(function listener(delta) {
+                    if (delta.id === downloadId && delta.state && delta.state.current === "complete") {
+                        chrome.downloads.onChanged.removeListener(listener);
+                        chrome.downloads.search({ id: downloadId }, (results) => resolve(results[0]));
+                    }
+                });
+            });
+
+            if (downloadItem && downloadItem.filename) {
+                console.log(`✅ Downloaded historical data to ${downloadItem.filename}`);
+                const historicalResponse = await fetch("http://127.0.0.1:5000/save_data", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        tickerSymbol,
+                        type: "historical_data",
+                        file_path: downloadItem.filename
+                    })
+                });
+                const historicalResult = await historicalResponse.json();
+                console.log(`✅ ${tickerSymbol} Historical Data saved:`, historicalResult);
+                chrome.downloads.removeFile(downloadId, () => console.log(`🗑️ Removed downloaded file for ${tickerSymbol}`));
+            } else {
+                console.error(`❌ Failed to download historical data for ${tickerSymbol}`);
+            }
+        }
     } catch (error) {
         console.error(`❌ Error saving data for ${tickerSymbol}:`, error);
     }
@@ -63,33 +118,7 @@ async function fetchTickersAndStartScraping() {
         await adjustTabs();
     } catch (error) {
         console.error("Error fetching tickers:", error);
-    }
-}
-
-// Process the ticker queue by initializing tabs
-async function processTickerQueue(delay) {
-    if (isPaused) {
-        console.log("⏸️ Scraping is paused.");
-        return;
-    }
-
-    const tabPromises = [];
-    const targetTabs = currentMaxTabs;
-    const currentActive = activeTabs.size;
-
-    if (currentActive < targetTabs) {
-        const tabsToCreate = targetTabs - currentActive;
-        for (let i = 0; i < tabsToCreate; i++) {
-            let tab = await chrome.tabs.create({ url: "about:blank", active: false });
-            activeTabs.add(tab.id);
-            console.log(`🌟 Created tab ${tab.id} for processing`);
-            tabPromises.push(processTab(tab.id));
-        }
-    }
-
-    if (tabPromises.length > 0) {
-        await Promise.all(tabPromises);
-        console.log("✅ All newly created tabs have finished processing.");
+        isRunning = false; // Reset on fetch failure
     }
 }
 
@@ -138,23 +167,21 @@ async function processTab(tabId) {
 
             if (hasExpectedContent) {
                 const scrapedData = await executeScraping(tabId, ticker);
-                await saveScrapedData(ticker, scrapedData.transactions);
+                await saveScrapedData(ticker, scrapedData);
                 console.log(`Scraped and saved data for ${ticker}:`, scrapedData);
             } else {
                 console.log(`Expected content not found for ${ticker}. Skipping...`);
             }
 
-            // Check if this tab should close gracefully after this scrape
             if (tabsToCloseGracefully.has(tabId)) {
                 console.log(`🛑 Tab ${tabId} finished current scrape, closing gracefully`);
                 activeTabs.delete(tabId);
                 tabsToCloseGracefully.delete(tabId);
                 chrome.tabs.remove(tabId);
-                return; // Exit the loop and stop processing
+                return;
             }
         } catch (error) {
             console.error(`Error in tab ${tabId} for ticker ${ticker || "unknown"}:`, error);
-            // If marked for closure, close even on error to avoid stalling
             if (tabsToCloseGracefully.has(tabId)) {
                 console.log(`🛑 Tab ${tabId} errored, closing gracefully`);
                 activeTabs.delete(tabId);
@@ -167,6 +194,12 @@ async function processTab(tabId) {
     console.log(`✅ Tab ${tabId} finished processing queue`);
     activeTabs.delete(tabId);
     chrome.tabs.remove(tabId);
+
+    // Check if all tabs are done
+    if (activeTabs.size === 0) {
+        console.log("✅ All tabs finished. Scraping complete.");
+        isRunning = false; // Reset isRunning when all tabs are done
+    }
 }
 
 // Adjust the number of active tabs based on currentMaxTabs
@@ -180,12 +213,12 @@ async function adjustTabs() {
             let tab = await chrome.tabs.create({ url: "about:blank", active: false });
             activeTabs.add(tab.id);
             console.log(`🌟 Created tab ${tab.id} for processing`);
-            processTab(tab.id);
+            processTab(tab.id); // Start processing immediately
         }
     } else if (currentActive > targetTabs) {
         const tabsToClose = Array.from(activeTabs).slice(targetTabs);
         for (let tabId of tabsToClose) {
-            tabsToCloseGracefully.add(tabId); // Mark for closure after current scrape
+            tabsToCloseGracefully.add(tabId);
             console.log(`⏳ Tab ${tabId} marked to close gracefully after current scrape`);
         }
     }
@@ -214,7 +247,7 @@ async function executeScraping(tabId, tickerSymbol) {
                     files: ["content.js"]
                 }).catch(err => console.error(`❌ Failed to inject content.js:`, err));
             }),
-            new Promise((_, reject) => setTimeout(() => reject(new Error("Scraping timeout")), 30000))
+            new Promise((_, reject) => setTimeout(() => reject(new Error("Scraping timeout")), 10000))
         ]);
 
         return scrapedData;
@@ -236,61 +269,23 @@ async function waitForTabLoad(tabId) {
     });
 }
 
-// Helper function to wait for a specified time
-function delay(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-// Check tab content for Cloudflare or expected elements with retries
+// Check tab content for Cloudflare or expected elements
 async function checkTabContent(tabId) {
-    const maxAttempts = 10;
-    let attempt = 1;
-
-    while (attempt <= maxAttempts) {
-        try {
-            const results = await chrome.scripting.executeScript({
-                target: { tabId },
-                func: () => {
-                    return {
-                        isCloudflare: document.title.includes("Just a moment"),
-                        hasExpectedContent: !!document.querySelector("#directors-transactions-root")
-                    };
-                }
-            });
-
-            const result = results[0].result;
-            console.log(`Attempt ${attempt} for tab ${tabId}:`, result);
-
-            // If we get a definitive result, return it
-            if (result.isCloudflare || result.hasExpectedContent) {
-                return result;
+    try {
+        const results = await chrome.scripting.executeScript({
+            target: { tabId },
+            func: () => {
+                return {
+                    isCloudflare: document.title.includes("Just a moment"),
+                    hasExpectedContent: !!document.querySelector("#directors-transactions-root") || !!document.querySelector("#directors-interests-root") || !!document.querySelector('a.btn[href*="download-historical-data"]')
+                };
             }
-
-            // If it's the last attempt, return the final result
-            if (attempt === maxAttempts) {
-                console.log(`Max attempts (${maxAttempts}) reached for tab ${tabId}`);
-                return result;
-            }
-
-            // Wait 1 second before the next attempt
-            await delay(1000);
-            attempt++;
-        } catch (error) {
-            console.error(`Error checking tab ${tabId} content on attempt ${attempt}:`, error);
-            
-            // If it's the last attempt, return default values
-            if (attempt === maxAttempts) {
-                return { isCloudflare: false, hasExpectedContent: false };
-            }
-
-            // Wait 1 second before retrying
-            await delay(1000);
-            attempt++;
-        }
+        });
+        return results[0].result;
+    } catch (error) {
+        console.error(`Error checking tab ${tabId} content:`, error);
+        return { isCloudflare: false, hasExpectedContent: false };
     }
-
-    // Fallback return (shouldn't reach here due to while loop logic)
-    return { isCloudflare: false, hasExpectedContent: false };
 }
 
 // Wait for Cloudflare to resolve
@@ -312,7 +307,7 @@ async function waitForExpectedContent(tabId) {
     return false;
 }
 
-// Unused functions from your original code (left as-is)
+// Unused functions (left as-is)
 function cleanupTab(tabId) {
     chrome.tabs.remove(tabId, () => {
         if (!chrome.runtime.lastError) {

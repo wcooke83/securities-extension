@@ -2,68 +2,69 @@
 
 console.log("content.js loaded into page");
 
+// Generic function to scrape table data
+function scrapeTableData(rootSelector, minCells, mapFn) {
+    const root = document.querySelector(rootSelector);
+    if (!root) {
+        console.log(`❌ No root found for ${rootSelector}.`);
+        return [];
+    }
+    const rows = root.querySelectorAll('tbody tr');
+    const data = [];
+    for (const row of rows) {
+        const cells = row.querySelectorAll('td');
+        if (cells.length < minCells) continue;
+        const item = mapFn(cells);
+        if (item) data.push(item);
+    }
+    console.log(`✅ Scraped ${data.length} items from ${rootSelector}`);
+    return data;
+}
+
+// Scrape transactions
 function scrapeTransactions() {
     console.log(`🔍 Scraping transactions for ${window.tickerSymbol}`);
-    const transactions = [];
-    const root = document.querySelector('#directors-transactions-root');
-    if (!root) {
-        console.log("❌ No transactions root found.");
-        return transactions;
-    }
-    const rows = root.querySelectorAll('tbody tr');
-    for (const row of rows) {
-        const cells = row.querySelectorAll('td');
-        if (cells.length < 6) continue;
-
-        const date = cells[0].textContent.trim();
-        const director = cells[1].textContent.trim();
-        const type = cells[2].textContent.trim();
-        const quantity = cells[3].textContent.trim().replace(/[^0-9-]/g, '');
-        const price = cells[4].textContent.trim().replace(/[^0-9.]/g, '');
-        const value = cells[5].textContent.trim().replace(/[^0-9.]/g, '');
-        const notes = cells[6].textContent.trim();
-
-        transactions.push({ date, director, type, quantity, price, value, notes });
-    }
-    console.log(`✅ Scraped ${transactions.length} transactions`);
-    return transactions;
+    return scrapeTableData('#directors-transactions-root', 6, (cells) => {
+        return {
+            date: cells[0].textContent.trim(),
+            director: cells[1].textContent.trim(),
+            type: cells[2].textContent.trim(),
+            quantity: cells[3].textContent.trim().replace(/[^0-9-]/g, ''),
+            price: cells[4].textContent.trim().replace(/[^0-9.]/g, ''),
+            value: cells[5].textContent.trim().replace(/[^0-9.]/g, ''),
+            notes: cells[6]?.textContent.trim() || ''
+        };
+    });
 }
 
+// Scrape director interests
 function scrapeDirectorInterests() {
     console.log(`🔍 Scraping director interests for ${window.tickerSymbol}`);
-    const directorInterests = [];
-    const root = document.querySelector('#directors-interests-root');
-    if (!root) {
-        console.log("❌ No director interests root found.");
-        return directorInterests;
-    }
-    const rows = root.querySelectorAll('tbody tr');
-    for (const row of rows) {
-        const cells = row.querySelectorAll('td');
-        if (cells.length < 3) continue;
-
-        const director = cells[0].textContent.trim();
-        const directShares = cells[1].textContent.trim().replace(/[^0-9]/g, '');
-        const indirectShares = cells[2].textContent.trim().replace(/[^0-9]/g, '');
-
-        directorInterests.push({ director, directShares, indirectShares });
-    }
-    console.log(`✅ Scraped ${directorInterests.length} director interests`);
-    return directorInterests;
+    return scrapeTableData('#directors-interests-root', 6, (cells) => {
+        return {
+            director: cells[0].textContent.trim(),
+            lastNotice: cells[1].textContent.trim(),
+            directShares: cells[2].textContent.trim().replace(/[^0-9]/g, '') || '0', // Handle N/A
+            indirectShares: cells[3].textContent.trim().replace(/[^0-9]/g, '') || '0', // Handle N/A
+            options: cells[4].textContent.trim().replace(/[^0-9]/g, '') || '0', // Handle N/A
+            convertibles: cells[5].textContent.trim().replace(/[^0-9]/g, '') || '0' // Handle N/A
+        };
+    });
 }
 
+// Scrape historical download URL
 function scrapeHistoricalDownloadUrl() {
     console.log(`🔍 Scraping historical download URL for ${window.tickerSymbol}`);
     const link = document.querySelector('a[href*="/download-historical-data/"]');
     if (link) {
-        const url = link.href;
-        console.log(`✅ Found historical download URL: ${url}`);
-        return url;
+        console.log(`✅ Found historical download URL: ${link.href}`);
+        return link.href;
     }
     console.log("❌ No historical download URL found.");
     return null;
 }
 
+// Scrape company overview with mappings
 function scrapeCompanyOverview() {
     console.log(`🔍 Scraping company overview for ${window.tickerSymbol}`);
     const overview = {
@@ -75,57 +76,34 @@ function scrapeCompanyOverview() {
         sharesIssued: null
     };
 
-    // Target the correct table for Market Cap
-    const marketCapTableRows = document.querySelectorAll('table.mi-table[data-company-market-rank-target="table"] tbody tr');
-    for (const row of marketCapTableRows) {
-        const cells = row.querySelectorAll('td');
-        if (cells.length < 2) continue;
+    const labelMappings = {
+        'market cap': { key: 'marketCap', cleaner: (v) => v.replace(/[^0-9]/g, '') },
+        'sector': { key: 'sector', cleaner: (v) => v },
+        'eps': { key: 'eps', cleaner: (v) => v.replace(/[^0-9.]/g, '') },
+        'dps': { key: 'dps', cleaner: (v) => v.replace(/[^0-9.]/g, '') },
+        'book value per share': { key: 'bookValuePerShare', cleaner: (v) => v.replace(/[^0-9.]/g, '') },
+        'shares issued': { key: 'sharesIssued', cleaner: (v) => v.replace(/[^0-9]/g, '') }
+    };
 
-        const label = cells[0].textContent.trim().toLowerCase();
-        const value = cells[1].textContent.trim();
-
-        if (label.includes('market cap')) {
-            overview.marketCap = value.replace(/[^0-9]/g, ''); // e.g., "$1,735,873,782" -> "1735873782"
+    const processRows = (rows) => {
+        for (const row of rows) {
+            const cells = row.querySelectorAll('td');
+            if (cells.length < 2) continue;
+            const label = cells[0].textContent.trim().toLowerCase();
+            const value = cells[1].textContent.trim();
+            const mapping = labelMappings[label];
+            if (mapping) overview[mapping.key] = mapping.cleaner(value);
         }
-    }
+    };
 
-    // Target the existing table for other fields
-    const otherRows = document.querySelectorAll('div.sm\\:flex.flex-wrap table tr');
-    if (!otherRows.length && !marketCapTableRows.length) {
-        console.log("❌ No company overview tables found.");
-        return overview;
-    }
-
-    for (const row of otherRows) {
-        const cells = row.querySelectorAll('td');
-        if (cells.length < 2) continue;
-
-        const label = cells[0].textContent.trim().toLowerCase();
-        const value = cells[1].textContent.trim();
-
-        switch (label) {
-            case 'sector':
-                overview.sector = value;
-                break;
-            case 'eps':
-                overview.eps = value.replace(/[^0-9.]/g, '');
-                break;
-            case 'dps':
-                overview.dps = value.replace(/[^0-9.]/g, '');
-                break;
-            case 'book value per share':
-                overview.bookValuePerShare = value.replace(/[^0-9.]/g, '');
-                break;
-            case 'shares issued':
-                overview.sharesIssued = value.replace(/[^0-9]/g, '');
-                break;
-        }
-    }
+    processRows(document.querySelectorAll('table.mi-table[data-company-market-rank-target="table"] tbody tr'));
+    processRows(document.querySelectorAll('div.sm\\:flex.flex-wrap table tr'));
 
     console.log(`✅ Scraped company overview:`, overview);
     return overview;
 }
 
+// Scrape company details with mappings
 function scrapeCompanyDetails() {
     console.log(`🔍 Scraping company details for ${window.tickerSymbol}`);
     const details = {
@@ -134,38 +112,30 @@ function scrapeCompanyDetails() {
         dateListed: null
     };
 
-    const rows = document.querySelectorAll('.content-box table.mi-table tr');
-    if (!rows.length) {
-        console.log("❌ No corporate details table found.");
-        return details;
-    }
+    const labelMappings = {
+        'website': { key: 'website', cleaner: (cells) => {
+            const link = cells[1].querySelector('a');
+            const raw = link ? link.href : cells[1].textContent.trim();
+            return raw ? raw.split('?')[0] : null;
+        }},
+        'auditor': { key: 'auditor', cleaner: (cells) => cells[1].textContent.trim() },
+        'date listed': { key: 'dateListed', cleaner: (cells) => cells[1].textContent.trim() }
+    };
 
+    const rows = document.querySelectorAll('.content-box table.mi-table tr');
     for (const row of rows) {
         const cells = row.querySelectorAll('td');
         if (cells.length < 2) continue;
-
         const label = cells[0].textContent.trim().toLowerCase();
-        const value = cells[1].textContent.trim();
-
-        switch (label) {
-            case 'website':
-                const link = cells[1].querySelector('a');
-                const rawWebsite = link ? link.href : value;
-                details.website = rawWebsite ? rawWebsite.split('?')[0] : null; // Remove query params
-                break;
-            case 'auditor':
-                details.auditor = value;
-                break;
-            case 'date listed':
-                details.dateListed = value;
-                break;
-        }
+        const mapping = labelMappings[label];
+        if (mapping) details[mapping.key] = mapping.cleaner(cells);
     }
 
     console.log(`✅ Scraped company details:`, details);
     return details;
 }
 
+// Utility functions (unchanged)
 function generateUniqueFilename(tickerSymbol, rawDate, sanitizedHeading, usedFilenames) {
     const [day, month, year] = rawDate.split('/');
     const formattedDate = `${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}`;
@@ -196,19 +166,10 @@ async function fetchFileSize(pdfLink) {
 async function getExistingFiles(tickerSymbol) {
     return new Promise((resolve) => {
         chrome.runtime.sendMessage({ action: "get_existing_files", tickerSymbol }, (response) => {
-            if (chrome.runtime.lastError) {
-                console.error("Error in getExistingFiles:", chrome.runtime.lastError.message);
-                resolve([]);
-            } else if (response && response.files) {
-                console.log(`📋 Retrieved ${response.files.length} existing files for ${tickerSymbol}`);
-                resolve(response.files);
-            } else {
-                console.log(`❌ No existing files found for ${tickerSymbol}`);
-                resolve([]);
-            }
+            resolve(response?.files || []);
         });
     }).catch(error => {
-        console.error(`❌ getExistingFiles failed for ${tickerSymbol}:`, error);
+        console.error(`❌ getExistingFiles failed:`, error);
         return [];
     });
 }
@@ -216,431 +177,292 @@ async function getExistingFiles(tickerSymbol) {
 async function getDownloadAnnouncementsSetting() {
     return new Promise((resolve) => {
         chrome.runtime.sendMessage({ action: "get_download_announcements" }, (response) => {
-            if (chrome.runtime.lastError) {
-                console.error("Error in getDownloadAnnouncementsSetting:", chrome.runtime.lastError.message);
-                resolve(true);
-            } else {
-                resolve(response.downloadAnnouncements !== undefined ? response.downloadAnnouncements : true);
-            }
+            resolve(response?.downloadAnnouncements ?? true);
         });
     }).catch(error => {
-        console.error("❌ getDownloadAnnouncementsSetting failed:", error);
+        console.error(`❌ getDownloadAnnouncementsSetting failed:`, error);
         return true;
     });
 }
 
+// Announcements scraping with improved structure
 async function scrapeAnnouncementsFromCurrentPage(tableContainer, usedFilenames, existingFiles, pageCounter, downloadAnnouncements) {
-    const announcements = [];
     const table = tableContainer.querySelector('table');
     if (!table) {
-        console.log("❌ No table found inside #app-table on this page.");
-        return announcements;
+        console.log(`❌ No table found on page ${pageCounter.value}`);
+        return [];
     }
     const rows = table.querySelectorAll('tbody tr');
-    if (rows.length === 0) {
-        console.log("❌ No announcement rows found on this page.");
-        return announcements;
+    if (!rows.length) {
+        console.log(`❌ No rows found on page ${pageCounter.value}`);
+        return [];
     }
-    console.log('🔎 Found announcement rows on current page:', rows.length);
 
-    let announcementCounter = { value: 0 };
-
+    const announcements = [];
     for (const row of rows) {
         const cells = row.querySelectorAll('td');
         if (cells.length < 5) continue;
 
         const rawDate = cells[0].textContent.trim();
         const rawTime = cells[3].textContent.trim();
-        const rawHeading = cells[1].textContent.trim();
-        let priceSensitive = false;
-        let cleanedHeading = rawHeading;
-        if (rawHeading.endsWith(' $')) {
-            priceSensitive = true;
-            cleanedHeading = rawHeading.slice(0, -2);
-        }
+        let rawHeading = cells[1].textContent.trim();
+        const priceSensitive = rawHeading.endsWith(' $');
+        const cleanedHeading = priceSensitive ? rawHeading.slice(0, -2) : rawHeading;
         const sanitizedHeading = cleanedHeading.replace(/[<>:"/\\|?*]+/g, '').trim().substring(0, 50);
         const pdfLink = cells[4].querySelector('a.announcement-pdf-link')?.href || null;
 
         const filename = generateUniqueFilename(window.tickerSymbol, rawDate, sanitizedHeading, usedFilenames);
         const fileSize = downloadAnnouncements && pdfLink ? await fetchFileSize(pdfLink) : 0;
 
-        const existingFile = existingFiles.find(f => f.filename === filename && f.fileSize === fileSize);
-        if (existingFile) {
-            console.log(`⏩ Skipping already downloaded file: ${filename} (${fileSize} bytes)`);
+        if (existingFiles.some(f => f.filename === filename && f.fileSize === fileSize)) {
+            console.log(`⏩ Skipping ${filename} (${fileSize} bytes)`);
             continue;
         }
 
-        announcementCounter.value++;
         announcements.push({
-            filename: filename,
+            filename,
             date: rawDate,
             heading: rawHeading,
             pages: parseInt(cells[2].textContent.trim()) || 0,
-            priceSensitive: priceSensitive,
+            priceSensitive,
             time: rawTime,
-            pdfLink: pdfLink,
-            fileSize: fileSize,
+            pdfLink,
+            fileSize,
             downloaded: downloadAnnouncements
         });
-        console.log(`📝 Page ${pageCounter.value} - ${announcementCounter.value} - Scraped announcement: ${sanitizedHeading}, filename: ${filename}, size: ${fileSize} bytes, downloaded: ${downloadAnnouncements}`);
     }
-    console.log(`✅ Scraped ${announcements.length} announcements from current page`);
+    console.log(`✅ Scraped ${announcements.length} announcements from page ${pageCounter.value}`);
     return announcements;
 }
 
 async function scrapeAnnouncements(transactions, directorInterests, historicalDownloadUrl, companyOverview, companyDetails) {
     console.log(`🔍 Scraping announcements for ${window.tickerSymbol}`);
     let allAnnouncements = [];
-    let usedFilenames = [];
-    let failedPages = [];
+    const usedFilenames = [];
+    const failedPages = [];
     const existingFiles = await getExistingFiles(window.tickerSymbol);
     const downloadAnnouncements = await getDownloadAnnouncementsSetting();
-    console.log(`📥 Download Announcements setting: ${downloadAnnouncements}`);
     const batchSize = 100;
-    let pageCounter = { value: 1 };
-    let retryCount = 0;
     const maxRetries = 5;
+    let pageCounter = { value: 1 };
     let isFinished = false;
-
-    const announcementsContainerId = window.tickerSymbol.toLowerCase() + '-all-announcements';
-    const announcementsContainer = document.querySelector(`#${announcementsContainerId}`);
+  
+    const announcementsContainer = document.querySelector(`#${window.tickerSymbol.toLowerCase()}-all-announcements`);
     if (!announcementsContainer) {
-        console.log(`⏹️ No announcements container found for ${window.tickerSymbol}, finishing scraping`);
-        sendFinalScrapedData(transactions, directorInterests, historicalDownloadUrl, companyOverview, companyDetails, allAnnouncements);
+        console.log(`⏹️ No announcements container found`);
+        await sendFinalScrapedData(transactions, directorInterests, historicalDownloadUrl, companyOverview, companyDetails, allAnnouncements);
         return;
     }
-    console.log(`🔎 Initial container found for ${window.tickerSymbol}`);
-
-    const announcementsTableContainer = announcementsContainer.querySelector('#app-table');
-    if (!announcementsTableContainer) {
-        console.log(`❌ No #app-table div found in container for ${window.tickerSymbol}`);
-        sendFinalScrapedData(transactions, directorInterests, historicalDownloadUrl, companyOverview, companyDetails, allAnnouncements);
+  
+    const tableContainer = announcementsContainer.querySelector('#app-table');
+    if (!tableContainer) {
+        console.log(`❌ No table container found`);
+        await sendFinalScrapedData(transactions, directorInterests, historicalDownloadUrl, companyOverview, companyDetails, allAnnouncements);
         return;
     }
-
-    const initialAnnouncements = await scrapeAnnouncementsFromCurrentPage(announcementsTableContainer, usedFilenames, existingFiles, pageCounter, downloadAnnouncements);
-    allAnnouncements = allAnnouncements.concat(initialAnnouncements);
-    if (initialAnnouncements.length === 0) {
-        console.log(`⏹️ No announcements found on initial page for ${window.tickerSymbol}, finishing scraping`);
-        sendFinalScrapedData(transactions, directorInterests, historicalDownloadUrl, companyOverview, companyDetails, allAnnouncements);
+  
+    // Scrape initial page
+    allAnnouncements = await scrapeAnnouncementsFromCurrentPage(tableContainer, usedFilenames, existingFiles, pageCounter, downloadAnnouncements);
+    if (!allAnnouncements.length) {
+        await sendFinalScrapedData(transactions, directorInterests, historicalDownloadUrl, companyOverview, companyDetails, allAnnouncements);
         return;
     }
-
+  
     let nextButton = announcementsContainer.querySelector('[data-pagination="next"]:not([disabled])');
-    console.log(`Next button check: ${nextButton ? 'Found' : 'Not found'}`);
     if (!nextButton) {
-        console.log(`🏁 No next button found for ${window.tickerSymbol}, finishing scraping`);
-        sendFinalScrapedData(transactions, directorInterests, historicalDownloadUrl, companyOverview, companyDetails, allAnnouncements);
+        await proceedWithFailedPages();
         return;
     }
-
-    if (allAnnouncements.length >= batchSize) {
-        await sendBatch(allAnnouncements);
-        allAnnouncements = [];
-    }
-
-    let timeoutId;
-    let observer;
-
-    const setupObserver = () => {
-        observer = new MutationObserver((mutations, obs) => {
-            console.log(`🔄 Mutation detected in #app-table for ${window.tickerSymbol}`);
-            obs.disconnect();
-            document.querySelector(`#dynamic-button`)?.remove();
-
-            checkAndCorrectPage(pageCounter, announcementsContainer, announcementsTableContainer, () => {
-                pageCounter.value++;
-                retryCount = 0;
-                scrapeAnnouncementsFromCurrentPage(announcementsTableContainer, usedFilenames, existingFiles, pageCounter, downloadAnnouncements).then(newAnnouncements => {
-                    allAnnouncements = allAnnouncements.concat(newAnnouncements);
-                    if (allAnnouncements.length >= batchSize) {
-                        const batch = allAnnouncements.splice(0, batchSize);
-                        sendBatch(batch).then(() => {
-                            allAnnouncements = [];
-                            proceedWithNextPage();
-                        });
-                    } else {
-                        proceedWithNextPage();
-                    }
-                }).catch(error => {
-                    console.error(`❌ Error scraping page ${pageCounter.value}:`, error);
-                    failedPages.push(pageCounter.value);
-                    console.log(`❌ Added page ${pageCounter.value} to failedPages due to scrape error:`, failedPages);
-                    proceedWithNextPage();
-                });
-            });
-        });
-        console.log(`🚀 Starting MutationObserver on #app-table for ${window.tickerSymbol}`);
-        observer.observe(announcementsTableContainer, { childList: true, subtree: true });
-    };
-
-    const checkAndCorrectPage = (pageCounter, container, tableContainer, callback) => {
-        const activeButton = container.querySelector('.btn.ghost.active');
-        if (activeButton) {
-            const activePage = activeButton.getAttribute('data-pagination');
-            const expectedPage = String(pageCounter.value + 1);
-
-            console.log(`🔍 Checking active page: ${Number(activePage)} vs expected page: ${Number(expectedPage)}`);
-
-            if (activePage !== expectedPage) {
-                console.log(`⚠️ Active page ${Number(activePage)} does not match expected page ${Number(expectedPage)}, correcting pagination`);
-
-                const position = parseInt(activeButton.getAttribute('data-position') || '0') + 1;
-                const newButton = document.createElement('button');
-                newButton.className = 'btn ghost';
-                newButton.setAttribute('data-pagination', expectedPage);
-                newButton.setAttribute('data-position', position);
-                newButton.id = 'dynamic-button';
-                newButton.innerHTML = expectedPage;
-
-                activeButton.insertAdjacentElement('afterend', newButton);
-
-                const tempObserver = new MutationObserver((mutations, obs) => {
-                    obs.disconnect();
-                    console.log(`✅ Loaded page ${expectedPage} via new button`);
-                    newButton.remove();
-                    callback();
-                });
-                tempObserver.observe(tableContainer, { childList: true, subtree: true });
-                newButton.click();
-            } else {
-                console.log(`✅ Active page ${Number(activePage)} matches expected page ${Number(expectedPage)}, proceeding with scraping`);
-                callback();
-            }
-        } else {
-            console.log(`❌ No active page button found after mutation`);
-            callback();
-        }
-    };
-
-    async function setPageTimeout() {
-        clearTimeout(timeoutId);
-        console.log(`⏳ Resetting timeout for ${window.tickerSymbol}, new 15s countdown started`);
-        timeoutId = setTimeout(async () => {
-            console.log(`⏰ 15-second timeout reached for ${window.tickerSymbol} on page `, (pageCounter.value + 1), `retryCount: ${retryCount}`);
-            observer?.disconnect();
-            document.querySelector(`#dynamic-button`)?.remove();
-
-            if (allAnnouncements.length > 0) {
-                console.log(`💾 Saving ${allAnnouncements.length} announcements before retry`);
-                await sendBatch(allAnnouncements);
-                allAnnouncements = [];
-            }
-
-            if (retryCount < maxRetries) {
-                retryCount++;
-                console.log(`🔄 Retrying page ${pageCounter.value}, attempt ${retryCount} of ${maxRetries}`);
-
-                const expectedPage = String(pageCounter.value);
-                const newButton = document.createElement('button');
-                newButton.className = 'btn ghost';
-                newButton.setAttribute('data-pagination', expectedPage);
-                newButton.setAttribute('data-position', '6');
-                newButton.id = 'dynamic-button';
-                newButton.innerHTML = expectedPage;
-
-                const activeButton = announcementsContainer.querySelector('.btn.ghost.active')
-                activeButton.insertAdjacentElement('afterend', newButton);
-
-                await setupObserver();
-                newButton.click();
-                setPageTimeout();
-
-            } else {
-                failedPages.push(pageCounter.value);
-                console.log(`❌ Added page`, pageCounter.value, `to failedPages:`, failedPages);
-                console.log(`🚨 Max retries (${maxRetries}) reached for page`, pageCounter.value, `moving to next page or finishing`);
-                const nextButton = announcementsContainer.querySelector('[data-pagination="next"]:not([disabled])');
-                if (nextButton) {
-                    pageCounter.value++;
-                    retryCount = 0;
-                    await setupObserver();
-                    nextButton.click();
-                    setPageTimeout();
-                } else if (!isFinished) {
-                    isFinished = true;
-                    sendFinalScrapedData(transactions, directorInterests, historicalDownloadUrl, companyOverview, companyDetails, allAnnouncements);
-                }
-            }
-        }, 15000);
-    }
-
+  
+    // Pagination for regular pages
     async function proceedWithNextPage() {
-        try {
-            nextButton = announcementsContainer.querySelector('[data-pagination="next"]:not([disabled])');
-            console.log(`Next button status: ${nextButton ? 'Enabled' : 'Not found or disabled'}`);
-            if (nextButton && !isFinished) {
-                console.log(`➡️ Preparing to click next button for ${window.tickerSymbol}`);
-
-                await setupObserver();
-                setPageTimeout();
-                nextButton.click();
-                console.log(`➡️ Next button clicked for ${window.tickerSymbol}`);
-            } else if (!isFinished) {
-                if (timeoutId) clearTimeout(timeoutId);
-                observer?.disconnect();
-                console.log(`🏁 No more pages for ${window.tickerSymbol}`);
-                sendFinalScrapedData(transactions, directorInterests, historicalDownloadUrl, companyOverview, companyDetails, allAnnouncements);
-            }
-        } catch (error) {
-            console.error(`❌ Error in proceedWithNextPage for ${window.tickerSymbol}:`, error);
-            if (!isFinished) {
-                if (timeoutId) clearTimeout(timeoutId);
-                observer?.disconnect();
-                sendFinalScrapedData(transactions, directorInterests, historicalDownloadUrl, companyOverview, companyDetails, allAnnouncements);
-            }
-        }
-    }
-
-    async function sendBatch(batch) {
-        return new Promise((resolve) => {
-            console.log(`📤 Sending batch of ${batch.length} announcements to background.js`);
-            chrome.runtime.sendMessage({ action: "save_announcement_batch", batch }, (response) => {
-                if (chrome.runtime.lastError) {
-                    console.error("Error sending batch:", chrome.runtime.lastError.message);
-                    resolve(false);
-                } else {
-                    console.log(`✅ Batch saved, response:`, response);
-                    resolve(response.success);
-                }
-            });
-        }).catch(error => {
-            console.error("❌ sendBatch failed:", error);
-            return false;
-        });
-    }
-
-    async function retryFailedPages() {
-        if (failedPages.length === 0) {
-            console.log(`✅ No failed pages to retry for ${window.tickerSymbol}`);
+        const nextButton = announcementsContainer.querySelector('[data-pagination="next"]:not([disabled])');
+        if (!nextButton || isFinished) {
+            await proceedWithFailedPages();
             return;
         }
-
-        console.log(`🔄 Retrying ${failedPages.length} failed pages for ${window.tickerSymbol}:`, failedPages);
-
-        const page = failedPages.shift();
-        console.log(`🔍 Attempting to scrape failed page ${page}`);
-
-        const newButton = document.createElement('button');
-        newButton.className = 'btn ghost';
-        newButton.setAttribute('data-pagination', String(page));
-        newButton.setAttribute('data-position', '7');
-        newButton.id = 'dynamic-button';
-        newButton.innerHTML = String(page);
-
-        const activeButton = announcementsContainer.querySelector('.btn.ghost.active');
-        activeButton.insertAdjacentElement('afterend', newButton);
-
-        const retryObserver = new MutationObserver(async (mutations, obs) => {
-            obs.disconnect();
-            newButton.remove();
-            console.log(`✅ Loaded failed page ${page} for retry`);
-
-            const activeButtonAfterLoad = announcementsContainer.querySelector('.btn.ghost.active');
-            const activePage = activeButtonAfterLoad ? activeButtonAfterLoad.getAttribute('data-pagination') : null;
-            if (activePage !== String(page)) {
-                console.error(`❌ Active page ${activePage} does not match expected page ${page}, keeping in failedPages`);
-                failedPages.unshift(page);
-                await retryFailedPages();
+  
+        let retryCount = 0;
+        let timeoutId;
+    
+        const observeAndScrape = async () => {
+            observer.disconnect();
+            clearTimeout(timeoutId);
+            document.querySelector('#dynamic-button')?.remove();
+    
+            pageCounter.value++;
+            const announcements = await scrapeAnnouncementsFromCurrentPage(tableContainer, usedFilenames, existingFiles, pageCounter, downloadAnnouncements);
+            allAnnouncements.push(...announcements);
+            if (allAnnouncements.length >= batchSize) {
+                await sendBatch(allAnnouncements.splice(0, batchSize));
+            }
+            await proceedWithNextPage();
+        };
+  
+        const retryLogic = async () => {
+            clearTimeout(timeoutId);
+            if (retryCount >= maxRetries) {
+                console.log(`❌ Max retries (${maxRetries}) reached for page ${pageCounter.value + 1}`);
+                failedPages.push(pageCounter.value + 1);
+                pageCounter.value++;
+                await proceedWithNextPage();
                 return;
             }
-
-            const newAnnouncements = await scrapeAnnouncementsFromCurrentPage(
-                announcementsTableContainer, 
-                usedFilenames, 
-                existingFiles, 
-                { value: page },
-                downloadAnnouncements
-            );
-            allAnnouncements = allAnnouncements.concat(newAnnouncements);
-            if (allAnnouncements.length >= batchSize) {
-                const batch = allAnnouncements.splice(0, batchSize);
-                await sendBatch(batch);
-                allAnnouncements = [];
+  
+            retryCount++;
+            console.log(`🔄 Retry ${retryCount}/${maxRetries} for page ${pageCounter.value + 1}`);
+            const freshNextButton = announcementsContainer.querySelector('[data-pagination="next"]:not([disabled])');
+            if (!freshNextButton) {
+                await proceedWithFailedPages();
+                return;
             }
-
-            console.log(`✅ Successfully scraped page ${page}, remaining failedPages:`, failedPages);
-
-            if (failedPages.length > 0) {
-                console.log(`🔄 Triggering retry for remaining ${failedPages.length} failed pages`);
-                await retryFailedPages();
-            }
-        });
-
-        retryObserver.observe(announcementsTableContainer, { childList: true, subtree: true });
-        retryButton.click();
+  
+            observer.observe(tableContainer, { childList: true, subtree: true });
+            freshNextButton.click();
+            timeoutId = setTimeout(retryLogic, 15000);
+        };
+  
+        const observer = new MutationObserver(observeAndScrape);
+        observer.observe(tableContainer, { childList: true, subtree: true });
+        nextButton.click();
+        timeoutId = setTimeout(retryLogic, 15000);
     }
-
-    function sendFinalScrapedData(transactions, directorInterests, historicalDownloadUrl, companyOverview, companyDetails, announcements) {
-        if (isFinished) return;
-        isFinished = true;
-
-        const finalAction = async () => {
-            if (announcements.length > 0) {
-                const success = await sendBatch(announcements);
-                if (!success) console.error("Failed to save last batch of announcements");
+  
+    // Handle failed pages
+    async function proceedWithFailedPages() {
+        while (failedPages.length > 0 && !isFinished) {
+            const failedPage = failedPages.shift();
+            console.log(`🔄 Retrying failed page ${failedPage}`);
+    
+            const dynamicButton = document.createElement('button');
+            dynamicButton.id = 'dynamic-button';
+            dynamicButton.setAttribute('data-pagination', String(failedPage));
+            dynamicButton.className = 'btn ghost';
+            announcementsContainer.appendChild(dynamicButton);
+    
+            try {
+                await new Promise((resolve, reject) => {
+                    const retryObserver = new MutationObserver(async () => {
+                        retryObserver.disconnect();
+                        dynamicButton.remove();
+                        console.log(`✅ Loaded failed page ${failedPage}`);
+    
+                        const announcements = await scrapeAnnouncementsFromCurrentPage(tableContainer, usedFilenames, existingFiles, { value: failedPage }, downloadAnnouncements);
+                        allAnnouncements.push(...announcements);
+                        if (allAnnouncements.length >= batchSize) {
+                            await sendBatch(allAnnouncements.splice(0, batchSize));
+                        }
+                        resolve();
+                    });
+                    retryObserver.observe(tableContainer, { childList: true, subtree: true });
+                    dynamicButton.click();
+    
+                    setTimeout(() => {
+                        retryObserver.disconnect();
+                        dynamicButton.remove();
+                        reject(new Error(`Retry timeout for page ${failedPage}`));
+                    }, 15000);
+                });
+            } catch (error) {
+                console.error(`❌ Failed to retry page ${failedPage}:`, error);
+                failedPages.push(failedPage);
             }
+        }
+    
+        if (!isFinished) {
+            console.log(`✅ All pages processed, including retries`);
+            await sendFinalScrapedData(transactions, directorInterests, historicalDownloadUrl, companyOverview, companyDetails, allAnnouncements);
+        }
+    }
+  
+    // Reusable batch sender
+    async function sendBatch(batch) {
+        return new Promise((resolve) => {
+            const timeout = setTimeout(() => {
+                console.log(`❌ ${window.tickerSymbol} Timeout waiting for save_announcement_batch response`);
+                resolve(false); // Fallback to false if no response
+            }, 30000); // 30-second timeout
 
-            await retryFailedPages();
-
-            const scrapedData = {
-                transactions,
-                director_interests: directorInterests,
-                historical_download_url: historicalDownloadUrl,
-                company_overview: companyOverview,
-                company_details: companyDetails
-            };
-            console.log(`✅ All announcements processed, sending final data:`, scrapedData);
-            chrome.runtime.sendMessage({ action: "scraping_complete", data: scrapedData }, (response) => {
+            chrome.runtime.sendMessage({ action: "save_announcement_batch", batch }, (response) => {
+                clearTimeout(timeout);
                 if (chrome.runtime.lastError) {
-                    console.error("Error sending final data:", chrome.runtime.lastError.message);
+                    console.error(`❌ ${window.tickerSymbol} Error sending batch: ${chrome.runtime.lastError.message}`);
+                    resolve(false);
                 } else {
-                    console.log("Received final response from background.js:", response);
+                    console.log(`✅ ${window.tickerSymbol} Sent batch of ${batch.length} announcements`);
+                    resolve(response?.success || false);
                 }
             });
-        };
+        });
+    }
+  
+    // Final data sender
+    async function sendFinalScrapedData(transactions, directorInterests, historicalDownloadUrl, companyOverview, companyDetails, announcements) {
+        if (isFinished) {
+            console.log(`Already finished for ${window.tickerSymbol}, skipping sendFinalScrapedData`);
+            return;
+        }
+        isFinished = true;
 
-        finalAction();
+        try {
+            if (announcements.length) {
+                console.log(`Sending final batch of ${announcements.length} announcements`);
+                await sendBatch(announcements);
+            }
+            const data = { transactions, director_interests: directorInterests, historical_download_url: historicalDownloadUrl, company_overview: companyOverview, company_details: companyDetails };
+            console.log(`Sending scraping_complete message for ${window.tickerSymbol}`);
+            await new Promise((resolve) => {
+                const timeout = setTimeout(() => {
+                    console.log(`❌ ${window.tickerSymbol} Timeout waiting for scraping_complete response`);
+                    resolve();
+                }, 30000); // 30-second timeout
+
+                chrome.runtime.sendMessage({ action: "scraping_complete", data }, (response) => {
+                    clearTimeout(timeout);
+                    if (chrome.runtime.lastError) {
+                        console.log(`❌ ${window.tickerSymbol} No listener for scraping_complete: ${chrome.runtime.lastError.message}`);
+                        resolve();
+                    } else {
+                        console.log(`Received response from background:`, response);
+                        resolve(response);
+                    }
+                });
+            });
+            console.log(`✅ ${window.tickerSymbol} Scraping completed`);
+        } catch (error) {
+            console.error(`❌ ${window.tickerSymbol} Error in sendFinalScrapedData:`, error);
+        }
     }
 
-    console.log(`🚀 Starting pagination for ${window.tickerSymbol}`);
-    proceedWithNextPage();
+    await proceedWithNextPage();
 }
 
 async function waitForBackground() {
     return new Promise((resolve, reject) => {
         let attempts = 0;
         const maxAttempts = 50;
-        const checkConnection = () => {
+        const check = () => {
             attempts++;
-            console.log(`Pinging background script (attempt ${attempts}/${maxAttempts})`);
             chrome.runtime.sendMessage({ action: "ping" }, (response) => {
-                if (chrome.runtime.lastError) {
-                    console.log(`Waiting for background script:`, chrome.runtime.lastError.message);
-                    if (attempts >= maxAttempts) {
-                        reject(new Error("Background script not responding after 5 seconds"));
-                    } else {
-                        setTimeout(checkConnection, 100);
-                    }
+                if (chrome.runtime.lastError && attempts < maxAttempts) {
+                    setTimeout(check, 100);
+                } else if (attempts >= maxAttempts) {
+                    reject(new Error("Background script not responding"));
                 } else {
-                    console.log("Background script is ready!");
                     resolve();
                 }
             });
         };
-        checkConnection();
-    }).catch(error => {
-        console.error("❌ Failed to connect to background script:", error);
-        throw error;
+        check();
     });
 }
 
 async function startScraping() {
     if (!window.tickerSymbol) {
-        console.error("❌ No ticker symbol defined, aborting scraping");
+        console.error("❌ No ticker symbol defined");
         return;
     }
-    console.log("🔍 content.js running for", window.tickerSymbol);
+    console.log(`🔍 Starting scraping for ${window.tickerSymbol}`);
     try {
         await waitForBackground();
         const transactions = scrapeTransactions();
@@ -650,10 +472,9 @@ async function startScraping() {
         const companyDetails = scrapeCompanyDetails();
         await scrapeAnnouncements(transactions, directorInterests, historicalDownloadUrl, companyOverview, companyDetails);
     } catch (error) {
-        console.error("❌ Scraping aborted:", error);
+        console.error("❌ Scraping failed:", error);
         chrome.runtime.sendMessage({ action: "scraping_complete", data: {} });
     }
 }
 
-// Start the scraping process immediately after injection
 startScraping();

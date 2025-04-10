@@ -42,35 +42,37 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             isRunning = true;
             currentMaxTabs = newMaxTabs;
             fetchTickersAndStartScraping().then(() => {
-                console.log(`✅ Scraping started with ${currentMaxTabs} tabs, downloadAnnouncements: ${downloadAnnouncements}, closeTabs: ${closeTabs}`);
+                console.log(`✅ Scraping started with ${currentMaxTabs} tabs, downloadAnnouncements: ${downloadAnnouncements}, closeTabs: ${closeTabs}`); // No tickerSymbol here, global action
                 chrome.runtime.sendMessage({ action: "status_update", isRunning: true, isPaused: false });
                 sendResponse({ success: true });
             }).catch((error) => {
-                console.error('Error starting scraping:', error);
+                console.error('Error starting scraping:', error); // No tickerSymbol, generic error
                 isRunning = false;
                 sendResponse({ success: false, error: error.message });
             });
         } else {
             currentMaxTabs = newMaxTabs;
             adjustTabs().then(() => {
-                console.log(`🔄 Adjusted to ${currentMaxTabs} tabs, downloadAnnouncements: ${downloadAnnouncements}, closeTabs: ${closeTabs}`);
+                console.log(`🔄 Adjusted to ${currentMaxTabs} tabs, downloadAnnouncements: ${downloadAnnouncements}, closeTabs: ${closeTabs}`); // No tickerSymbol, global adjustment
                 chrome.runtime.sendMessage({ action: "status_update", isRunning: true, isPaused: false });
                 sendResponse({ success: true });
             }).catch((error) => {
-                console.error('Error adjusting tabs:', error);
+                console.error('Error adjusting tabs:', error); // No tickerSymbol, generic error
                 sendResponse({ success: false, error: error.message });
             });
         }
         return true;
     } else if (message.action === "pause_scraping") {
         isPaused = true;
-        console.log("Scraping paused.");
+        console.log("Scraping paused."); // No tickerSymbol, global state change
         chrome.runtime.sendMessage({ action: "status_update", isRunning: true, isPaused: true });
+        return true;
     } else if (message.action === "resume_scraping") {
         isPaused = false;
-        console.log("Scraping resumed.");
+        console.log("Scraping resumed."); // No tickerSymbol, global state change
         processTickerQueue(message.delay);
         chrome.runtime.sendMessage({ action: "status_update", isRunning: true, isPaused: false });
+        return true;
     } else if (message.action === "get_existing_files") {
         const tickerSymbol = message.tickerSymbol;
         fetch(`http://127.0.0.1:5000/api/files/${tickerSymbol}`)
@@ -79,11 +81,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                 return response.json();
             })
             .then(data => {
-                console.log(`Retrieved ${data.files.length} existing files for ${tickerSymbol}`);
+                console.log(`✅ ${tickerSymbol} Retrieved ${data.files.length} existing files`);
                 sendResponse({ files: data.files });
             })
             .catch(error => {
-                console.error(`Error fetching existing files for ${tickerSymbol}: ${error.message}`, error);
+                console.error(`❌ ${tickerSymbol} Error fetching existing files: ${error.message}`, error);
                 sendResponse({ files: [] });
             });
         return true;
@@ -92,7 +94,31 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return true;
     } else if (message.action === "save_announcement_batch") {
         const batch = message.batch;
-        console.log(`Received batch of ${batch.length} announcements`);
+        console.log(`Received batch of ${batch.length} announcements`); // No tickerSymbol yet, pre-processing
+
+        async function saveBatch(announcementsWithTicker) {
+            try {
+                const tickerSymbol = announcementsWithTicker[0]?.tickerSymbol.split('.AX')[0] || "UNKNOWN";
+                const response = await fetch('http://127.0.0.1:5000/api/announcements', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ announcements: announcementsWithTicker })
+                });
+                if (!response.ok) throw new Error(`HTTP error! Status: ${response.status}`);
+                const result = await response.json();
+                if (result.status === "success") {
+                    console.log(`✅ ${tickerSymbol} Saved batch of ${batch.length} announcements to DB`);
+                    return { success: true };
+                } else {
+                    console.error(`❌ ${tickerSymbol} Failed to save batch:`, result.error);
+                    return { success: false, error: result.error };
+                }
+            } catch (error) {
+                const tickerSymbol = announcementsWithTicker[0]?.tickerSymbol.split('.AX')[0] || "UNKNOWN";
+                console.error(`❌ ${tickerSymbol} Error saving batch to DB:`, error);
+                return { success: false, error: error.message };
+            }
+        }
 
         async function handleBatch() {
             const tickerSymbol = sender.tab ? sender.tab.url.split('/').pop().toUpperCase() : "UNKNOWN";
@@ -105,8 +131,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                 for (let announcement of announcementsWithTicker) {
                     if (announcement.pdfLink && !announcement.downloaded) {
                         const relativeFilename = `announcements/${tickerSymbol}/${announcement.filename}`;
-                        console.log(`📥 Downloading PDF for ${announcement.filename}`);
-
+                        console.log(`📥 ${tickerSymbol} Downloading PDF for ${announcement.filename}`);
                         let isValidPdf = false;
                         try {
                             const headResponse = await Promise.race([
@@ -115,76 +140,64 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                             ]);
                             if (headResponse.ok && headResponse.headers.get("Content-Type")?.includes("application/pdf")) {
                                 isValidPdf = true;
-                                console.log(`✅ PDF URL is valid`);
+                                console.log(`✅ ${tickerSymbol} PDF URL is valid`);
                             } else {
-                                console.log(`❌ PDF URL invalid (Status: ${headResponse.status} or not a PDF)`);
+                                console.log(`❌ ${tickerSymbol} PDF URL invalid (Status: ${headResponse.status} or not a PDF)`);
                                 announcement.pdfLocalPath = null;
                                 continue;
                             }
                         } catch (e) {
-                            console.error(`❌ Error validating PDF URL ${announcement.pdfLink}:`, e.message);
+                            console.error(`❌ ${tickerSymbol} Error validating PDF URL ${announcement.pdfLink}:`, e.message);
                             announcement.pdfLocalPath = null;
                             continue;
                         }
-
                         if (isValidPdf) {
-                            const downloadId = await new Promise((resolve) => {
-                                chrome.downloads.download({
-                                    url: announcement.pdfLink,
-                                    filename: relativeFilename,
-                                    saveAs: false,
-                                    conflictAction: "overwrite"
-                                }, resolve);
-                            });
-
-                            const downloadItem = await waitForDownloadComplete(downloadId);
+                            const downloadId = await new Promise(resolve => chrome.downloads.download({
+                                url: announcement.pdfLink,
+                                filename: relativeFilename,
+                                saveAs: false,
+                                conflictAction: "overwrite"
+                            }, resolve));
+                            const downloadItem = await waitForDownload(downloadId);
                             if (downloadItem && downloadItem.filename) {
-                                console.log(`✅ Downloaded announcement PDF to ${downloadItem.filename}`);
+                                console.log(`✅ ${tickerSymbol} Downloaded announcement PDF to ${downloadItem.filename}`);
                                 announcement.pdfLocalPath = downloadItem.filename;
                                 announcement.downloaded = true;
                             } else {
-                                console.error(`❌ Failed to download announcement PDF for ${announcement.filename}`);
+                                console.error(`❌ ${tickerSymbol} Failed to download announcement PDF for ${announcement.filename}`);
                                 announcement.pdfLocalPath = null;
                             }
                         }
                     }
                 }
             } else {
-                console.log(`⏩ Skipping PDF downloads for batch (downloadAnnouncements disabled)`);
+                console.log(`⏩ ${tickerSymbol} Skipping PDF downloads for batch (downloadAnnouncements disabled)`);
                 announcementsWithTicker.forEach(a => a.pdfLocalPath = null);
             }
 
-            try {
-                const response = await fetch('http://127.0.0.1:5000/api/announcements', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ announcements: announcementsWithTicker })
+            const result = await saveBatch(announcementsWithTicker);
+            if (!result.success) {
+                console.log(`❌ ${tickerSymbol} Notifying popup of save failure`);
+                chrome.runtime.sendMessage({
+                    action: 'save_failed',
+                    batch: announcementsWithTicker,
+                    error: result.error,
+                    tabId: sender.tab?.id
                 });
-                if (!response.ok) throw new Error(`HTTP error! Status: ${response.status}`);
-                const result = await response.json();
-                if (result.status === "success") {
-                    console.log(`Saved batch of ${batch.length} announcements to DB`);
-                    return { success: true };
-                } else {
-                    console.error("Failed to save batch:", result.error);
-                    return { success: false, error: result.error };
-                }
-            } catch (error) {
-                console.error('Error saving batch to DB:', error);
-                return { success: false, error: error.message };
             }
+            return result;
         }
 
         handleBatch().then(result => sendResponse(result));
         return true;
     } else if (message.action === "scraping_complete") {
         const data = message.data;
-        console.log("Received scraping_complete:", data);
+        console.log("Received scraping_complete:", data); // No tickerSymbol yet, pre-processing
         const tickerSymbol = sender.tab ? sender.tab.url.split('/').pop().toUpperCase() : "UNKNOWN";
         saveScrapedData(tickerSymbol, data).then(() => {
             sendResponse({ success: true });
         }).catch(error => {
-            console.error('Error in scraping_complete:', error);
+            console.error(`❌ ${tickerSymbol} Error in scraping_complete:`, error);
             sendResponse({ success: false, error: error.message });
         });
         return true; // Changed to true for async response
@@ -340,6 +353,10 @@ async function processTab(tabId) {
             }
 
             ticker = tickerQueue.shift();
+            if (!ticker) {
+                console.log(`No more tickers in queue for tab ${tabId}`);
+                break;
+            }
             if (processedTickers.has(ticker)) {
                 console.log(`⏩ Ticker ${ticker} already processed in tab ${tabId}, skipping`);
                 continue;
@@ -395,7 +412,10 @@ async function processTab(tabId) {
                 return;
             }
         }
+
+        console.log(`✅ Completed ${ticker} in tab ${tabId}, checking next ticker`);
     }
+
     console.log(`✅ Tab ${tabId} finished processing queue`);
     activeTabs.delete(tabId);
     if (closeTabs) {
@@ -405,10 +425,21 @@ async function processTab(tabId) {
         console.log(`⏹️ Keeping tab ${tabId} open (closeTabs disabled)`);
     }
 
-    if (activeTabs.size === 0) {
-        console.log("✅ All tabs finished. Scraping complete.");
+    if (activeTabs.size === 0 && tickerQueue.length === 0) {
+        console.log("✅ All tabs finished and queue empty. Scraping complete.");
         isRunning = false;
-        chrome.runtime.sendMessage({ action: "status_update", isRunning: false, isPaused: false });
+        try {
+            chrome.runtime.sendMessage({ action: "status_update", isRunning: false, isPaused: false }, (response) => {
+                if (chrome.runtime.lastError) {
+                    console.log("No listener for status_update (e.g., popup closed), continuing anyway:", chrome.runtime.lastError.message);
+                }
+            });
+        } catch (error) {
+            console.error("Error sending status_update message:", error.message);
+        }
+    } else if (tickerQueue.length > 0) {
+        console.log(`More tickers remain (${tickerQueue.length}), spawning new tab`);
+        await adjustTabs();
     }
 }
 

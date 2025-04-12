@@ -33,6 +33,13 @@ def db_connect():
 
 engine = db_connect()
 
+# Utility function to normalize ticker symbols
+def normalize_ticker(ticker):
+    if not ticker:
+        return None
+    ticker = ticker.upper()
+    return ticker if ticker.endswith('.AX') else f"{ticker}.AX"
+
 @app.route("/get_tickers", methods=["GET"])
 def get_tickers():
     conn = None
@@ -46,7 +53,7 @@ def get_tickers():
                     WHERE i.is_active = TRUE 
                     AND i.instrument_type = 'stock' 
                     AND i.ticker_symbol LIKE '%.AX'
-                    ORDER BY i.last_scrape_attempt DESC, symbol ASC;'''
+                    ORDER BY i.last_scrape_attempt ASC, symbol ASC;'''
         cursor.execute(query)
         tickers = [row[0] for row in cursor.fetchall()]
         logger.info(f"Fetched {len(tickers)} tickers.")
@@ -72,7 +79,8 @@ def get_tickers():
 def get_existing_files(tickerSymbol):
     conn = None
     try:
-        logger.info(f"Fetching existing files for {tickerSymbol}")
+        formatted_ticker_symbol = normalize_ticker(tickerSymbol)
+        logger.info(f"Fetching existing files for {formatted_ticker_symbol}")
         conn = engine.raw_connection()
         cursor = conn.cursor()
 
@@ -81,9 +89,9 @@ def get_existing_files(tickerSymbol):
             FROM announcements 
             WHERE ticker_symbol = %s
         """
-        cursor.execute(query, (f"{tickerSymbol}.AX",))
+        cursor.execute(query, (formatted_ticker_symbol,))
         files = [{"filename": row[0], "file_size": row[1]} for row in cursor.fetchall()]
-        logger.info(f"Fetched {len(files)} existing files for {tickerSymbol}")
+        logger.info(f"Fetched {len(files)} existing files for {formatted_ticker_symbol}")
 
         cursor.close()
         conn.close()
@@ -124,9 +132,10 @@ def save_announcements():
                 logger.warning(f"Invalid date for announcement {announcement.get('filename')}, skipping...")
                 continue
 
+            ticker_symbol = normalize_ticker(announcement.get("tickerSymbol"))
             announcement_time = clean_time(announcement.get("time"))
             batch_data.append((
-                announcement.get("tickerSymbol"),
+                ticker_symbol,
                 announcement_date,
                 announcement.get("heading"),
                 announcement.get("pages"),
@@ -138,7 +147,15 @@ def save_announcements():
                 announcement.get("downloaded", False)
             ))
 
-        if batch_data:
+        seen_pdf_links = set()
+        unique_batch_data = []
+        for row in batch_data:
+            pdf_link = row[5]  # pdf_link is at index 5
+            if pdf_link not in seen_pdf_links:
+                seen_pdf_links.add(pdf_link)
+                unique_batch_data.append(row)
+
+        if unique_batch_data:
             query = """
                 INSERT INTO announcements (ticker_symbol, date, heading, pages, time, pdf_link, filename, file_size, price_sensitive, downloaded)
                     VALUES %s
@@ -152,14 +169,8 @@ def save_announcements():
                         price_sensitive = EXCLUDED.price_sensitive,
                         downloaded = EXCLUDED.downloaded
             """
-            execute_values(cursor, query, batch_data)
-            logger.info(f"Saved {len(batch_data)} announcements for {announcements[0].get('tickerSymbol')}")
-
-            ticker_symbol = announcements[0].get("tickerSymbol")
-            cursor.execute(
-                """UPDATE market_instruments SET announcements_last_updated = %s WHERE ticker_symbol = %s""",
-                (datetime.now(), ticker_symbol)
-            )
+            execute_values(cursor, query, unique_batch_data)
+            logger.info(f"Saved {len(unique_batch_data)} announcements for {unique_batch_data[0][0]}")
 
         conn.commit()
         cursor.close()
@@ -178,6 +189,51 @@ def save_announcements():
                 logger.info("Connection closed in save_announcements.")
             except Exception as e:
                 logger.error(f"Error closing connection in save_announcements: {e}")
+
+@app.route("/update_announcements_last_updated", methods=["POST"])
+def update_announcements_last_updated():
+    conn = None
+    try:
+        data = request.json
+        ticker_symbol = data.get("tickerSymbol")
+        if not ticker_symbol:
+            return jsonify({"error": "tickerSymbol is required"}), 400
+        
+        formatted_ticker_symbol = normalize_ticker(ticker_symbol)
+        logger.info(f"Updating announcements_last_updated for {formatted_ticker_symbol}")
+        
+        conn = engine.raw_connection()
+        cursor = conn.cursor()
+        
+        update_query = """
+            UPDATE market_instruments 
+            SET announcements_last_updated = %s
+            WHERE ticker_symbol = %s
+        """
+        cursor.execute(update_query, (datetime.now(), formatted_ticker_symbol))
+        
+        if cursor.rowcount == 0:
+            logger.warning(f"No record found for {formatted_ticker_symbol}")
+        else:
+            logger.info(f"Updated announcements_last_updated for {formatted_ticker_symbol}")
+        
+        conn.commit()
+        cursor.close()
+        conn.close()
+        return jsonify({"status": "success", "message": f"Updated announcements_last_updated for {formatted_ticker_symbol}"})
+    
+    except Exception as e:
+        logger.error(f"Error updating announcements_last_updated for {ticker_symbol}: {e}")
+        if conn is not None:
+            conn.rollback()
+        return jsonify({"error": "Internal Server Error", "details": str(e)}), 500
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+                logger.info("Connection closed in update_announcements_last_updated.")
+            except Exception as e:
+                logger.error(f"Error closing connection in update_announcements_last_updated: {e}")
 
 @app.route("/save_data", methods=["POST", "OPTIONS"])
 def save_data():
@@ -199,19 +255,23 @@ def save_data():
         conn = engine.raw_connection()
         cursor = conn.cursor()
 
-        formatted_ticker_symbol = f"{data.get('tickerSymbol')}.AX"
+        formatted_ticker_symbol = normalize_ticker(data.get("tickerSymbol"))
         transactions = data.get("transactions", [])
         director_interests = data.get("director_interests", [])
         file_path = data.get("historical_download_url")
         company_overview = data.get("company_overview", {})
         company_details = data.get("company_details", {})
 
-        # Record scrape attempt
+        # Record scrape attempt and log result
+        current_time = datetime.now()
         cursor.execute(
             """UPDATE market_instruments SET last_scrape_attempt = %s WHERE ticker_symbol = %s""",
-            (datetime.now(), formatted_ticker_symbol)
+            (current_time, formatted_ticker_symbol)
         )
-        logger.debug(f"Recorded scrape attempt for {formatted_ticker_symbol}")
+        if cursor.rowcount == 0:
+            logger.warning(f"No record updated for last_scrape_attempt for {formatted_ticker_symbol} - ticker may not exist")
+        else:
+            logger.info(f"Updated last_scrape_attempt to {current_time} for {formatted_ticker_symbol}")
 
         # Save transactions
         if transactions:

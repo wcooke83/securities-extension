@@ -11,7 +11,7 @@ from psycopg2.extras import execute_values
 
 logging.basicConfig(
     filename=f"{os.path.splitext(os.path.basename(__file__))[0]}.log",
-    level=logging.DEBUG,
+    level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
@@ -190,40 +190,86 @@ def save_announcements():
             except Exception as e:
                 logger.error(f"Error closing connection in save_announcements: {e}")
 
-@app.route("/update_announcements_last_updated", methods=["POST"])
-def update_announcements_last_updated():
+# New endpoint for saving API-fetched announcements
+@app.route("/api/announcements_via_api", methods=["POST"])
+def save_api_announcements():
     conn = None
     try:
         data = request.json
-        ticker_symbol = data.get("tickerSymbol")
-        if not ticker_symbol:
-            return jsonify({"error": "tickerSymbol is required"}), 400
-        
-        formatted_ticker_symbol = normalize_ticker(ticker_symbol)
-        logger.info(f"Updating announcements_last_updated for {formatted_ticker_symbol}")
-        
+        announcements = data.get("announcements", [])
+        total_announcements = len(announcements)
+        logger.info(f"Received save_api_announcements request with {total_announcements} announcements")
+
+        if not announcements:
+            return jsonify({"error": "No announcements provided"}), 400
+
         conn = engine.raw_connection()
         cursor = conn.cursor()
-        
-        update_query = """
-            UPDATE market_instruments 
-            SET announcements_last_updated = %s
-            WHERE ticker_symbol = %s
-        """
-        cursor.execute(update_query, (datetime.now(), formatted_ticker_symbol))
-        
-        if cursor.rowcount == 0:
-            logger.warning(f"No record found for {formatted_ticker_symbol}")
-        else:
-            logger.info(f"Updated announcements_last_updated for {formatted_ticker_symbol}")
-        
+
+        for announcement in announcements:
+            ticker_symbol = normalize_ticker(announcement.get("tickerSymbol"))
+            identifier = announcement.get("identifier")
+            file_id = announcement.get("fileId")
+            page_count = announcement.get("pageCount")
+            symbol_id = announcement.get("symbolId")
+            security_name = announcement.get("securityName")
+            file_size = announcement.get("fileSize")
+            heading = announcement.get("heading")
+            date_time = announcement.get("dateTime")
+            file_type = announcement.get("fileType")
+            is_price_sensitive = announcement.get("isPriceSensitive", False)
+            file_key = announcement.get("fileKey")
+            types = announcement.get("types", [])
+
+            # Insert into announcement_records
+            insert_record_query = """
+                INSERT INTO announcement_records (ticker_symbol, identifier, file_id, page_count, symbol_id, security_name, file_size, heading, date_time, file_type, is_price_sensitive, file_key)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (identifier) DO UPDATE SET
+                    ticker_symbol = EXCLUDED.ticker_symbol,
+                    file_id = EXCLUDED.file_id,
+                    page_count = EXCLUDED.page_count,
+                    symbol_id = EXCLUDED.symbol_id,
+                    security_name = EXCLUDED.security_name,
+                    file_size = EXCLUDED.file_size,
+                    heading = EXCLUDED.heading,
+                    date_time = EXCLUDED.date_time,
+                    file_type = EXCLUDED.file_type,
+                    is_price_sensitive = EXCLUDED.is_price_sensitive,
+                    file_key = EXCLUDED.file_key
+                RETURNING id
+            """
+            cursor.execute(insert_record_query, (
+                ticker_symbol, identifier, file_id, page_count, symbol_id, security_name, file_size, heading, date_time, file_type, is_price_sensitive, file_key
+            ))
+            announcement_id = cursor.fetchone()[0]
+
+            # Handle types
+            for announcement_type in types:
+                type_title = announcement_type.get("title")
+                # Ensure the type exists in announcement_types
+                cursor.execute("SELECT id FROM announcement_types WHERE title = %s", (type_title,))
+                type_row = cursor.fetchone()
+                if type_row:
+                    type_id = type_row[0]
+                else:
+                    cursor.execute("INSERT INTO announcement_types (title) VALUES (%s) RETURNING id", (type_title,))
+                    type_id = cursor.fetchone()[0]
+
+                # Link the announcement to the type
+                cursor.execute("""
+                    INSERT INTO announcement_type_links (announcement_id, type_id)
+                    VALUES (%s, %s)
+                    ON CONFLICT DO NOTHING
+                """, (announcement_id, type_id))
+
         conn.commit()
         cursor.close()
         conn.close()
-        return jsonify({"status": "success", "message": f"Updated announcements_last_updated for {formatted_ticker_symbol}"})
-    
+        return jsonify({"status": "success"})
+
     except Exception as e:
-        logger.error(f"Error updating announcements_last_updated for {ticker_symbol}: {e}")
+        logger.error(f"Error in save_api_announcements: {str(e)}")
         if conn is not None:
             conn.rollback()
         return jsonify({"error": "Internal Server Error", "details": str(e)}), 500
@@ -231,9 +277,9 @@ def update_announcements_last_updated():
         if conn is not None:
             try:
                 conn.close()
-                logger.info("Connection closed in update_announcements_last_updated.")
+                logger.info("Connection closed in save_api_announcements.")
             except Exception as e:
-                logger.error(f"Error closing connection in update_announcements_last_updated: {e}")
+                logger.error(f"Error closing connection in save_api_announcements: {e}")
 
 @app.route("/save_data", methods=["POST", "OPTIONS"])
 def save_data():
@@ -247,7 +293,7 @@ def save_data():
 
     conn = None
     try:
-        logger.info(f"Received save_data request: {request.json}")
+        logger.info(f"Received save_data request:")
         data = request.json
         if not data or "tickerSymbol" not in data:
             return jsonify({"error": "Invalid request format: missing tickerSymbol"}), 400
@@ -258,23 +304,23 @@ def save_data():
         formatted_ticker_symbol = normalize_ticker(data.get("tickerSymbol"))
         transactions = data.get("transactions", [])
         director_interests = data.get("director_interests", [])
-        file_path = data.get("historical_download_url")
+        historical_data_filepath = data.get("historical_data_filepath")
         company_overview = data.get("company_overview", {})
         company_details = data.get("company_details", {})
+        updated_timestamps = data.get("updated_timestamps", {})
 
         # Record scrape attempt and log result
-        current_time = datetime.now()
-        cursor.execute(
-            """UPDATE market_instruments SET last_scrape_attempt = %s WHERE ticker_symbol = %s""",
-            (current_time, formatted_ticker_symbol)
-        )
+        query = """UPDATE market_instruments SET last_scrape_attempt = CURRENT_TIMESTAMP WHERE ticker_symbol = %s"""
+        cursor.execute(query, (formatted_ticker_symbol, ))
         if cursor.rowcount == 0:
-            logger.warning(f"No record updated for last_scrape_attempt for {formatted_ticker_symbol} - ticker may not exist")
+            logger.warning(f"Failed to process save_data for {formatted_ticker_symbol} - ticker may not exist")
+            return jsonify({"error": f"Failed to process save_data for {formatted_ticker_symbol} - ticker may not exist"}), 500
         else:
-            logger.info(f"Updated last_scrape_attempt to {current_time} for {formatted_ticker_symbol}")
+            logger.info(f"Updated last_scrape_attempt to CURRENT_TIMESTAMP for {formatted_ticker_symbol}")
 
         # Save transactions
         if transactions:
+
             batch_data = [
                 (
                     formatted_ticker_symbol,
@@ -301,10 +347,7 @@ def save_data():
             """
             execute_values(cursor, query, deduped_data)
             logger.info(f"Saved {len(transactions)} transactions for {formatted_ticker_symbol}")
-            cursor.execute(
-                """UPDATE market_instruments SET director_transactions_last_updated = %s WHERE ticker_symbol = %s""",
-                (datetime.now(), formatted_ticker_symbol)
-            )
+            updated_timestamps["director_transactions_last_updated"] = True
 
         # Save director interests
         if director_interests:
@@ -323,18 +366,16 @@ def save_data():
             """
             execute_values(cursor, query, batch_data)
             logger.info(f"Saved {len(director_interests)} director interests for {formatted_ticker_symbol}")
-            cursor.execute(
-                """UPDATE market_instruments SET director_interests_last_updated = %s WHERE ticker_symbol = %s""",
-                (datetime.now(), formatted_ticker_symbol)
-            )
+            updated_timestamps["director_interests_last_updated"] = True
 
-        # Save historical data from file_path
-        if file_path:
-            if not os.path.exists(file_path):
-                return jsonify({"error": f"File not found at {file_path}"}), 400
+        # Save historical data from historical_data_filepath
+        if historical_data_filepath:
+
+            if not os.path.exists(historical_data_filepath):
+                return jsonify({"error": f"File not found at {historical_data_filepath}"}), 400
             
-            logger.debug(f"Reading historical data from {file_path}")
-            with open(file_path, 'r') as f:
+            logger.debug(f"Reading historical data from {historical_data_filepath}")
+            with open(historical_data_filepath, 'r') as f:
                 csv_content = f.read().splitlines()
             
             headers = csv_content[0].split(",")
@@ -378,7 +419,7 @@ def save_data():
                     logger.error(f"Error processing historical record {line}: {str(e)}")
                     conn.rollback()
                     return jsonify({"error": f"Failed to process historical record: {str(e)}"}), 500
-
+                
             if batch_data:
                 query = """
                     INSERT INTO market_history_as_traded (ticker_symbol, date, open, high, low, close, adj_close, volume)
@@ -393,17 +434,15 @@ def save_data():
                 """
                 execute_values(cursor, query, batch_data)
                 logger.info(f"Successfully saved {historical_records_saved}/{total_records} historical records for {formatted_ticker_symbol}")
-                cursor.execute(
-                    """UPDATE market_instruments SET historical_as_traded_last_updated = %s WHERE ticker_symbol = %s""",
-                    (datetime.now(), formatted_ticker_symbol)
-                )
+                updated_timestamps["historical_as_traded_last_updated"] = True
             elif total_records > 0:
                 conn.rollback()
                 return jsonify({"error": f"Failed to save historical data for {formatted_ticker_symbol}: no valid records processed"}), 500
 
         # Save company overview and details to market_instruments
         if company_overview or company_details:
-            update_query = """
+
+            update_query = f"""
                 UPDATE market_instruments 
                 SET 
                     market_cap = %s,
@@ -430,6 +469,30 @@ def save_data():
                 formatted_ticker_symbol
             ))
             logger.info(f"Updated market_instruments with company overview and details for {formatted_ticker_symbol}")
+
+
+
+        if len(updated_timestamps) > 0:
+
+            updated_timestamps["director_transactions_last_updated"] = 'CURRENT_TIMESTAMP' if updated_timestamps.get("director_transactions_last_updated") else "null"
+            updated_timestamps["director_interests_last_updated"] = 'CURRENT_TIMESTAMP' if updated_timestamps.get("director_interests_last_updated") else "null"
+            updated_timestamps["historical_as_traded_last_updated"] = 'CURRENT_TIMESTAMP' if updated_timestamps.get("historical_as_traded_last_updated") else "null"
+            updated_timestamps["announcements_api_fetched_last_updated"] = 'CURRENT_TIMESTAMP' if updated_timestamps.get("announcements_api_fetched_last_updated") else "null"
+            updated_timestamps["announcements_scraped_last_updated"] = 'CURRENT_TIMESTAMP' if updated_timestamps.get("announcements_scraped_last_updated") else "null"
+
+            update_query = f"""
+                UPDATE market_instruments 
+                SET 
+                    director_transactions_last_updated = {updated_timestamps["director_transactions_last_updated"]},
+                    director_interests_last_updated = {updated_timestamps["director_interests_last_updated"]},
+                    historical_as_traded_last_updated = {updated_timestamps["historical_as_traded_last_updated"]},
+                    announcements_api_fetched_last_updated = {updated_timestamps["announcements_api_fetched_last_updated"]},
+                    announcements_scraped_last_updated = {updated_timestamps["announcements_scraped_last_updated"]}
+                WHERE ticker_symbol = %s
+            """
+            cursor.execute(update_query, (formatted_ticker_symbol, ))
+            logger.info(f"Updated market_instruments with company overview and details for {formatted_ticker_symbol}")
+
 
         conn.commit()
         logger.info("Changes committed to the database successfully.")

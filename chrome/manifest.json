@@ -2,7 +2,7 @@
   "name": "ASX Scraper",
   "version": "1.0",
   "manifest_version": 3,
-  "permissions": ["activeTab", "scripting", "tabs", "storage", "downloads"],
+  "permissions": ["alarms", "activeTab", "scripting", "tabs", "storage", "downloads"],
   "host_permissions": ["https://www.marketindex.com.au/*", "https://data-api.marketindex.com.au/*"],
   "background": { "service_worker": "background.js" },
   "action": { "default_popup": "popup.html" }

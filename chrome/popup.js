@@ -4,16 +4,20 @@ document.addEventListener('DOMContentLoaded', () => {
     const resumeButton = document.getElementById('resumeButton');
     const updateConfigButton = document.getElementById('updateConfigButton');
     const maxTabsInput = document.getElementById('maxTabs');
-    const downloadAnnouncementsCheckbox = document.getElementById('downloadAnnouncements');
+    const fetchViaApiCheckbox = document.getElementById('fetchViaApi');
+    const scrapeFromWebCheckbox = document.getElementById('scrapeFromWeb');
+    const downloadPdfsCheckbox = document.getElementById('downloadPdfs');
     const closeTabsCheckbox = document.getElementById('closeTabs');
     const statusDiv = document.getElementById('status');
 
     let currentStatus = 'Idle'; // Track the current scraping status
 
     // Load saved settings
-    chrome.storage.local.get(['maxTabs', 'downloadAnnouncements', 'closeTabs'], (data) => {
+    chrome.storage.local.get(['maxTabs', 'fetchViaApi', 'scrapeFromWeb', 'downloadPdfs', 'closeTabs'], (data) => {
         if (data.maxTabs) maxTabsInput.value = data.maxTabs;
-        if (data.downloadAnnouncements !== undefined) downloadAnnouncementsCheckbox.checked = data.downloadAnnouncements;
+        if (data.fetchViaApi !== undefined) fetchViaApiCheckbox.checked = data.fetchViaApi;
+        if (data.scrapeFromWeb !== undefined) scrapeFromWebCheckbox.checked = data.scrapeFromWeb;
+        if (data.downloadPdfs !== undefined) downloadPdfsCheckbox.checked = data.downloadPdfs;
         if (data.closeTabs !== undefined) closeTabsCheckbox.checked = data.closeTabs;
     });
 
@@ -41,7 +45,9 @@ document.addEventListener('DOMContentLoaded', () => {
     function getConfig() {
         return {
             maxTabs: parseInt(maxTabsInput.value),
-            downloadAnnouncements: downloadAnnouncementsCheckbox.checked,
+            fetchViaApi: fetchViaApiCheckbox.checked,
+            scrapeFromWeb: scrapeFromWebCheckbox.checked,
+            downloadPdfs: downloadPdfsCheckbox.checked,
             closeTabs: closeTabsCheckbox.checked
         };
     }

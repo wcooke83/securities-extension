@@ -1,3 +1,32 @@
+// content.js
+const tabId = window.tabid;
+const usedFilenames = [];
+const successfulPages = new Set();
+let failedPages = [];
+let allAnnouncements = [];
+const apiSaveFetchedAnnouncementMaxRetries = 5;
+const apiSaveFetchedAnnouncementSendBatchSize = 500;
+const apiSaveFetchedAnnouncementSendRetryTime = 30000;
+const apiSaveFetchedAnnouncementFailPause = true;
+const apiFetchAnnouncementMaxRetries = 5;
+const apiFetchAnnouncementRetryTime = 30000;
+const apiFetchAnnouncementFailPause = true;
+const apiFetchAnnouncementTimeout = 30000; // Timeout for fetch (ms)
+const apiFetchAnnouncementTimeoutRetryTime = 10000; // Delay after timeout (ms)
+const apiFetchAnnouncementTimeoutMaxRetries = 3; // Max timeout retries
+const apiFetchAnnouncementTimeoutFailPause = true; // Pause on timeout failure
+const scrapedAnnouncementScrapeMaxRetries = 5;
+const scrapedAnnouncementSendBatchMaxRetries = 5;
+const scrapedAnnouncementSendBatchRetryTime = 5000;
+const scrapedAnnouncementSendBatchSize = 100;
+let pageCounter = { value: 1 };
+let isFinished = false;
+let isPaused = false;
+let isScraping = false;
+let totalScrapeableAnnouncements = 0;
+let totalAPIFetchedAnnouncements = 0;
+let currentState = 'resumed';
+
 console.log("content.js loaded into page");
 
 // Derive tickerSymbol from URL
@@ -9,11 +38,133 @@ const allPdfLinks = new Set();
 const announcementsContainer = document.querySelector(`${toValidSelector(tickerSymbol.toLowerCase())}-all-announcements`);
 const tableContainer = announcementsContainer?.querySelector('#app-table');
 
-let totalScrapeableAnnouncements = 0;
-let totalAPIFetchedAnnouncements = 0;
+// Utility to send messages with metadata
+function sendRuntimeMessage(message, callback, retries = 3, delayMs = 3000) {
+    const messageWithMeta = {
+        ...message,
+        target: 'background',
+        timestamp: Date.now(),
+        source: 'content'
+    };
+
+    let attempt = 1;
+
+    function trySend() {
+        chrome.runtime.sendMessage(messageWithMeta, (response) => {
+            if (chrome.runtime.lastError) {
+                console.error(`[${tickerSymbol}] Error sending ${message.action} (attempt ${attempt}/${retries}): ${chrome.runtime.lastError.message}`);
+                if (attempt < retries) {
+                    attempt++;
+                    setTimeout(trySend, delayMs);
+                } else {
+                    console.error(`[${tickerSymbol}] Failed to send ${message.action} after ${retries} attempts`);
+                    callback?.({ success: false, error: chrome.runtime.lastError.message });
+                }
+                return;
+            }
+            console.log(`[${tickerSymbol}] Sent ${message.action}, response:`, response);
+            callback?.(response);
+        });
+    }
+
+    console.log(`[${tickerSymbol}] Sending ${message.action} to background`);
+    trySend();
+}
+
+// Add message listener for pause/resume commands
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (message.tabId !== tabId) {
+        sendResponse({ received: true, ignored: true });
+        return true;
+    }
+
+    switch (message.action) {
+        case 'pause_tab':
+            if (!isPaused) {
+                isPaused = true;
+                currentState = 'paused';
+                updateTabStatus("Paused");
+                console.log(`⏸️ ${tickerSymbol} Pause command received`);
+                chrome.runtime.sendMessage({ action: "tab_paused", tabId });
+            }
+            sendResponse({ success: true });
+            break;
+        case 'resume_tab':
+            if (isPaused) {
+                isPaused = false;
+                currentState = 'resumed';
+                updateTabStatus("Resuming");
+                console.log(`▶️ ${tickerSymbol} Resume command received`);
+                chrome.runtime.sendMessage({ action: "resume_tab", tabId });
+            }
+            sendResponse({ success: true });
+            break;
+        case 'ping':
+            sendResponse({ status: 'pong' });
+            break;
+        default:
+            sendResponse({ received: true, ignored: true });
+    }
+    return true;
+});
+
+// Function to check pause state and wait if paused
+async function checkPause() {
+    if (isPaused && currentState !== 'paused') {
+        currentState = 'paused';
+        updateTabStatus("Paused");
+        console.log(`⏸️ ${tickerSymbol} Paused, Waiting to resume`);
+        chrome.runtime.sendMessage({ action: "tab_paused", tabId });
+        await checkResume(); // Wait for resume before proceeding
+    } else if (!isPaused && currentState !== 'resumed') {
+        currentState = 'resumed';
+        updateTabStatus("Resuming");
+        console.log(`▶️ ${tickerSymbol} Un-Paused, Resumed`);
+        chrome.runtime.sendMessage({ action: "resume_tab", tabId });
+    }
+    // If state doesn't change, do nothing (no redundant messages)
+}
+
+// Function to wait for resume
+async function checkResume() {
+    if (currentState !== 'paused') return; // No need to wait if not paused
+
+    return new Promise((resolve) => {
+        const listener = (message, sender, sendResponse) => {
+            if (message.action === 'resume_tab' && message.tabId === tabId) {
+                isPaused = false;
+                currentState = 'resumed';
+                updateTabStatus("Resuming");
+                console.log(`▶️ ${tickerSymbol} Resume signal received`);
+                chrome.runtime.sendMessage({ action: "resume_tab", tabId });
+                chrome.runtime.onMessage.removeListener(listener); // Remove listener after use
+                sendResponse({ received: true });
+                resolve();
+            }
+        };
+        chrome.runtime.onMessage.addListener(listener);
+    });
+}
 
 function toValidSelector(id) {
     return `#${id.replace(/^(\d)/, '\\3$1 ')}`;
+}
+
+// Update tab status with custom message
+function updateTabStatus(status) {
+    chrome.runtime.sendMessage({
+        action: 'update_tab_status',
+        status
+    });
+}
+
+// Update tab ticker symbol
+function updateTabTicker(ticker) {
+    chrome.runtime.sendMessage({
+        action: 'update_tab_ticker',
+        ticker
+    });
+    updateTabStatus("Starting");
 }
 
 // Generic function to scrape table data
@@ -93,7 +244,7 @@ function scrapeCompanyOverview() {
     const labelMappings = {
         'market cap': { key: 'marketCap', cleaner: (v) => v.replace(/[^0-9]/g, '') },
         'sector': { key: 'sector', cleaner: (v) => v },
-        'eps': { key: 'eps', cleaner: (v) => v.replace(/[^0-9.-]/g, '') }, // Allow negative sign
+        'eps': { key: 'eps', cleaner: (v) => v.replace(/[^0-9.-]/g, '') },
         'dps': { key: 'dps', cleaner: (v) => v.replace(/[^0-9.]/g, '') },
         'book value per share': { key: 'bookValuePerShare', cleaner: (v) => v.replace(/[^0-9.]/g, '') },
         'shares issued': { key: 'sharesIssued', cleaner: (v) => v.replace(/[^0-9]/g, '') }
@@ -103,8 +254,7 @@ function scrapeCompanyOverview() {
         for (const row of rows) {
             const cells = row.querySelectorAll('td');
             if (cells.length < 2) continue;
-            // Get the label from the first cell, prioritizing inner span for Market Cap
-            let label = cells[0].querySelector('span.inline-block')?.textContent.trim().toLowerCase() || 
+            let label = cells[0].querySelector('span.inline-block')?.textContent.trim().toLowerCase() ||
                         cells[0].textContent.trim().toLowerCase();
             const value = cells[1].textContent.trim();
             const mapping = labelMappings[label];
@@ -114,9 +264,8 @@ function scrapeCompanyOverview() {
         }
     };
 
-    // Target specific tables for Market Cap and Key Fundamentals
-    processRows(document.querySelectorAll('table.mi-table[data-company-market-rank-target="table"] tbody tr')); // Market Cap, ASX Rank, Sector Rank
-    processRows(document.querySelectorAll('div.sm\\:flex.flex-wrap table.mi-table tbody tr')); // Key Fundamentals (Sector, EPS, DPS, etc.)
+    processRows(document.querySelectorAll('table.mi-table[data-company-market-rank-target="table"] tbody tr'));
+    processRows(document.querySelectorAll('div.sm\\:flex.flex-wrap table.mi-table tbody tr'));
 
     console.log(`✅ Scraped company overview:`, overview);
     return overview;
@@ -185,74 +334,22 @@ async function fetchFileSize(pdfLink) {
     }
 }
 
-async function getExistingFiles(tickerSymbol) {
+async function getChromeSetting({ action, defaultValue, extractValue, params = {} }) {
     return new Promise((resolve) => {
         try {
-            chrome.runtime.sendMessage({ action: "get_existing_files", tickerSymbol }, (response) => {
+            chrome.runtime.sendMessage({ action, ...params }, (response) => {
                 if (chrome.runtime.lastError) {
-                    console.error(`❌ getExistingFiles error: ${chrome.runtime.lastError.message}`);
-                    resolve([]);
+                    console.error(`❌ ${action} error: ${chrome.runtime.lastError.message}`);
+                    resolve(defaultValue);
                     return;
                 }
-                resolve(response?.files || []);
-            });
-        } catch (error) {
-            console.error(`❌ getExistingFiles failed: ${error.message}`);
-            resolve([]);
-        }
-    });
-}
 
-async function getDownloadAnnouncementsSetting() {
-    return new Promise((resolve) => {
-        try {
-            chrome.runtime.sendMessage({ action: "get_download_announcements" }, (response) => {
-                if (chrome.runtime.lastError) {
-                    console.error(`❌ getDownloadAnnouncementsSetting error: ${chrome.runtime.lastError.message}`);
-                    resolve(true);
-                    return;
-                }
-                resolve(response?.downloadAnnouncements ?? true);
+                const value = extractValue ? extractValue(response) : response;
+                resolve(value ?? defaultValue);
             });
         } catch (error) {
-            console.error(`❌ getDownloadAnnouncementsSetting failed: ${error.message}`);
-            resolve(true);
-        }
-    });
-}
-
-async function getFetchViaApiSetting() {
-    return new Promise((resolve) => {
-        try {
-            chrome.runtime.sendMessage({ action: "get_fetch_via_api" }, (response) => {
-                if (chrome.runtime.lastError) {
-                    console.error(`❌ getFetchViaApiSetting error: ${chrome.runtime.lastError.message}`);
-                    resolve(false);
-                    return;
-                }
-                resolve(response?.fetchViaApi ?? false);
-            });
-        } catch (error) {
-            console.error(`❌ getFetchViaApiSetting failed: ${error.message}`);
-            resolve(false);
-        }
-    });
-}
-
-async function getScrapeFromWebSetting() {
-    return new Promise((resolve) => {
-        try {
-            chrome.runtime.sendMessage({ action: "get_scrape_from_web" }, (response) => {
-                if (chrome.runtime.lastError) {
-                    console.error(`❌ getScrapeFromWebSetting error: ${chrome.runtime.lastError.message}`);
-                    resolve(true);
-                    return;
-                }
-                resolve(response?.scrapeFromWeb ?? true);
-            });
-        } catch (error) {
-            console.error(`❌ getScrapeFromWebSetting failed: ${error.message}`);
-            resolve(true);
+            console.error(`❌ ${action} failed: ${error.message}`);
+            resolve(defaultValue);
         }
     });
 }
@@ -276,15 +373,19 @@ function dedupeAnnouncements(announcements, tickerSymbol) {
 
 // Announcements scraping
 async function scrapeAnnouncementsFromCurrentPage(tableContainer, usedFilenames, existingFiles, pageCounter, downloadAnnouncements, successfulPages) {
+    await checkPause(); // Check pause before scraping
     try {
+        updateTabStatus("Scrape Announcements");
         let table = tableContainer.querySelector('table');
         if (!table) {
             console.log(`❌ No table found on page ${pageCounter.value}, observing tableContainer for changes`);
+            updateTabStatus("Observe Announcements Table");
             return new Promise((resolve) => {
                 const observer = new MutationObserver(async (mutations, obs) => {
                     table = tableContainer.querySelector('table');
                     if (table) {
                         obs.disconnect();
+                        updateTabStatus("Scrape Announcements");
                         console.log(`✅ Table detected on page ${pageCounter.value} after mutation`);
                         const announcements = await scrapeAnnouncementsFromCurrentPage(
                             tableContainer,
@@ -302,11 +403,11 @@ async function scrapeAnnouncementsFromCurrentPage(tableContainer, usedFilenames,
                     observer.disconnect();
                     console.log(`⏳ Timeout waiting for table on page ${pageCounter.value}, resolving with empty array`);
                     resolve([]);
-                }, 10000); // Reduced timeout for faster recovery
+                }, 10000);
             });
         }
 
-        await new Promise(resolve => setTimeout(resolve, 500)); // Brief delay for DOM stability
+        await new Promise(resolve => setTimeout(resolve, 500));
         const rows = table.querySelectorAll('tbody tr');
         if (!rows.length) {
             console.log(`❌ No rows found on page ${pageCounter.value}`);
@@ -318,6 +419,7 @@ async function scrapeAnnouncementsFromCurrentPage(tableContainer, usedFilenames,
         const activeTabNumber = activeButton
             ? parseInt(activeButton.getAttribute('data-pagination'), 10)
             : pageCounter.value;
+        updateTabStatus(`Scrape Announcements Page: ${activeTabNumber}`);
         console.log(`📍 Active page for ${tickerSymbol} is ${activeTabNumber}`);
 
         let announcements = [];
@@ -369,10 +471,8 @@ async function scrapeAnnouncementsFromCurrentPage(tableContainer, usedFilenames,
             });
         }
 
-        // Deduplicate announcements
         announcements = dedupeAnnouncements(announcements, tickerSymbol);
 
-        // Check if page is successful
         if (announcements.length > 0) {
             const buttons = parentContainer.querySelectorAll('button.btn.ghost');
             const highestVisiblePage = buttons.length
@@ -397,32 +497,20 @@ async function scrapeAnnouncementsFromCurrentPage(tableContainer, usedFilenames,
 }
 
 async function scrapeAnnouncements(transactions, directorInterests, historicalDownloadUrl, companyOverview, companyDetails) {
+    await checkPause(); // Check pause before starting
     console.log(`🔍 Scraping announcements for ${tickerSymbol}`);
-    let allAnnouncements = [];
-    const usedFilenames = [];
-    const successfulPages = new Set();
-    let failedPages = [];
-    const existingFiles = await getExistingFiles(tickerSymbol);
-    const fetchViaApi = await getFetchViaApiSetting();
-    const scrapeFromWeb = await getScrapeFromWebSetting();
-    const downloadAnnouncements = await getDownloadAnnouncementsSetting();
-    const apiFetchedAnnouncementMaxRetries = 5;
-    const apiFetchedAnnouncementSendBatchSize = 500;
-    const apiFetchedAnnouncementSendRetryTime = 5000;
-    const scrapedAnnouncementScrapeMaxRetries = 5;
-    const scrapedAnnouncementSendBatchMaxRetries = 5;
-    const scrapedAnnouncementSendBatchRetryTime = 5000;
-    let pageCounter = { value: 1 };
-    let isFinished = false;
-    let isPaused = false;
 
-    // Fetch announcements via API if checked
-    if (fetchViaApi) {
-        await fetchAnnouncementsViaApi(tickerSymbol, apiFetchedAnnouncementSendBatchSize);
+    existingFiles = await getChromeSetting({ action: "get_existing_files", defaultValue: [], extractValue: (res) => res?.files, params: { tickerSymbol } });
+    downloadAnnouncements = await getChromeSetting({ action: "get_download_announcements", defaultValue: false, extractValue: (res) => res?.downloadPdfs });
+    apiFetchAnnouncements = await getChromeSetting({ action: "api_fetch_announcements", defaultValue: true, extractValue: (res) => res?.apiFetchAnnouncements });
+    webScrapeAnnouncements = await getChromeSetting({ action: "web_scrap_announcements", defaultValue: false, extractValue: (res) => res?.webScrapeAnnouncements });
+    
+    if (apiFetchAnnouncements) {
+        console.log(`⏹️ fetchAnnouncementsViaApi:`, tickerSymbol, apiSaveFetchedAnnouncementSendBatchSize);
+        await fetchAnnouncementsViaApi(tickerSymbol, apiSaveFetchedAnnouncementSendBatchSize);
     }
 
-    // Skip web scraping if not checked
-    if (!scrapeFromWeb) {
+    if (!webScrapeAnnouncements) {
         console.log(`⏹️ ${tickerSymbol} Scrape announcements via web is not checked`);
         await sendFinalScrapedData(transactions, directorInterests, historicalDownloadUrl, companyOverview, companyDetails, allAnnouncements);
         return;
@@ -444,7 +532,6 @@ async function scrapeAnnouncements(transactions, directorInterests, historicalDo
     allAnnouncements = await scrapeAnnouncementsFromCurrentPage(tableContainer, usedFilenames, existingFiles, pageCounter, downloadAnnouncements, successfulPages);
     console.log(`📄 Page ${pageCounter.value} scraped, found ${allAnnouncements.length} announcements`);
 
-    // Send initial announcements if no next page or batch immediately
     if (allAnnouncements.length > 0) {
         let nextButton = announcementsContainer.querySelector('[data-pagination="next"]:not([disabled])');
         if (!nextButton) {
@@ -452,8 +539,8 @@ async function scrapeAnnouncements(transactions, directorInterests, historicalDo
             await sendScrapedBatch(allAnnouncements.splice(0, allAnnouncements.length));
             await proceedWithFailedScrapedPages();
             return;
-        } else if (allAnnouncements.length >= scrapedAnnouncementsBatchSize) {
-            await sendScrapedBatch(allAnnouncements.splice(0, scrapedAnnouncementsBatchSize));
+        } else if (allAnnouncements.length >= scrapedAnnouncementSendBatchSize) {
+            await sendScrapedBatch(allAnnouncements.splice(0, scrapedAnnouncementSendBatchSize));
         }
     } else {
         await sendFinalScrapedData(transactions, directorInterests, historicalDownloadUrl, companyOverview, companyDetails, allAnnouncements);
@@ -461,6 +548,7 @@ async function scrapeAnnouncements(transactions, directorInterests, historicalDo
     }
 
     async function proceedToScrapeNextPage() {
+        await checkPause(); // Check pause before proceeding
         const nextButton = announcementsContainer.querySelector('[data-pagination="next"]:not([disabled])');
         if (!nextButton || isFinished) {
             console.log(`⏹️ No more pages to scrape for ${tickerSymbol}`);
@@ -477,12 +565,14 @@ async function scrapeAnnouncements(transactions, directorInterests, historicalDo
             document.querySelector('#dynamic-button')?.remove();
 
             pageCounter.value++;
+            updateTabStatus(`Scrape Page: ${pageCounter.value}`);
+
             console.log(`📄 Scraping page ${pageCounter.value} for ${tickerSymbol}`);
             const announcements = await scrapeAnnouncementsFromCurrentPage(tableContainer, usedFilenames, existingFiles, pageCounter, downloadAnnouncements, successfulPages);
             console.log(`📄 Page ${pageCounter.value} scraped, found ${announcements.length} announcements`);
             allAnnouncements.push(...announcements);
-            if (allAnnouncements.length >= scrapedAnnouncementsBatchSize) {
-                await sendScrapedBatch(allAnnouncements.splice(0, scrapedAnnouncementsBatchSize));
+            if (allAnnouncements.length >= scrapedAnnouncementSendBatchSize) {
+                await sendScrapedBatch(allAnnouncements.splice(0, scrapedAnnouncementSendBatchSize));
             }
             await proceedToScrapeNextPage();
         };
@@ -490,6 +580,7 @@ async function scrapeAnnouncements(transactions, directorInterests, historicalDo
         const retryLogic = async () => {
             clearTimeout(timeoutId);
             if (retryCount >= scrapedAnnouncementScrapeMaxRetries) {
+                updateTabStatus(`Scrape Page: ${pageCounter.value + 1}, Max retries (${scrapedAnnouncementScrapeMaxRetries}) reached`);
                 console.log(`❌ Max retries (${scrapedAnnouncementScrapeMaxRetries}) reached for page ${pageCounter.value + 1}, marking as failed`);
                 failedPages.push(pageCounter.value + 1);
                 await proceedToScrapeNextPage();
@@ -497,6 +588,8 @@ async function scrapeAnnouncements(transactions, directorInterests, historicalDo
             }
 
             retryCount++;
+            await checkPause(); // Check pause during retries
+            updateTabStatus(`Scrape Page: ${pageCounter.value + 1}, Retry ${retryCount}/${scrapedAnnouncementScrapeMaxRetries}`);
             console.log(`🔄 Retry ${retryCount}/${scrapedAnnouncementScrapeMaxRetries} for page ${pageCounter.value + 1}`);
             const activeButton = getActiveBtn();
             if (!activeButton) {
@@ -517,15 +610,14 @@ async function scrapeAnnouncements(transactions, directorInterests, historicalDo
     }
 
     async function proceedWithFailedScrapedPages() {
+        await checkPause(); // Check pause before proceeding
         if (isFinished) return;
-    
+
         try {
-            // Get pagination buttons
             const buttons = Array.from(
                 tableContainer.querySelectorAll('button.btn.ghost[data-position]:not([style*="display: none"]):not(#dynamic-button)')
             );
-    
-            // Calculate total pages with fallback
+
             let totalPages = 1;
             if (buttons.length > 0) {
                 const lastButton = buttons[buttons.length - 1];
@@ -537,33 +629,29 @@ async function scrapeAnnouncements(transactions, directorInterests, historicalDo
                 }
             }
             console.log(`📊 Total pages for ${tickerSymbol}: ${totalPages}`);
-    
-            // Identify failed pages
+
             const allPages = Array.from({ length: totalPages }, (_, i) => i + 1);
-            const failedPages = allPages.filter((page) => !successfulPages.has(page));
+            failedPages = allPages.filter((page) => !successfulPages.has(page));
             console.log(`🛑 Failed pages for ${tickerSymbol}: ${failedPages.length > 0 ? failedPages.join(', ') : 'None'}`);
-    
-            // Retry failed pages if any
+
             if (failedPages.length > 0) {
                 await retryFailedScrapedPages(failedPages, tableContainer, isFinished);
             }
-    
-            // Process remaining announcements and final data
+
             if (!isFinished) {
                 if (allAnnouncements.length > 0) {
                     await sendScrapedBatch(allAnnouncements.splice(0, allAnnouncements.length));
                 }
-    
-                console.log(`📈 ${tickerSymbol} Total unique announcements: ${uniqueAnnouncementsCount}, Calculated total: ${calculatedTotal}`);
+
                 await sendFinalScrapedData(transactions, directorInterests, historicalDownloadUrl, companyOverview, companyDetails, allAnnouncements);
             }
         } catch (error) {
             console.error(`❌ Error in proceedWithFailedScrapedPages for ${tickerSymbol}:`, error);
         }
     }
-    
-    // Helper Functions
+
     async function handlePageLoad(failedPage) {
+        await checkPause(); // Check pause before loading page
         try {
             console.log(`✅ Loaded failed page ${failedPage}`);
             const announcements = await scrapeAnnouncementsFromCurrentPage(
@@ -571,36 +659,36 @@ async function scrapeAnnouncements(transactions, directorInterests, historicalDo
             );
             console.log(`📄 Failed page ${failedPage} scraped, found ${announcements.length} announcements`);
             allAnnouncements.push(...announcements);
-            if (allAnnouncements.length >= scrapedAnnouncementsBatchSize) {
-                await sendScrapedBatch(allAnnouncements.splice(0, scrapedAnnouncementsBatchSize));
+            if (allAnnouncements.length >= scrapedAnnouncementSendBatchSize) {
+                await sendScrapedBatch(allAnnouncements.splice(0, scrapedAnnouncementSendBatchSize));
             }
             return announcements;
         } catch (error) {
             console.error(`❌ Error handling page load for ${failedPage}:`, error);
-            throw error; // Propagate to retry logic
+            throw error;
         }
     }
-    
+
     function paginateClick(page) {
         const btnGroup = document.querySelector(
             `#${window.location.pathname.split('/').pop().split('.').shift().toLowerCase().replace(/^(\d)/, '\\3$1 ')}-all-announcements div.btn-group`
-        )
-        const btn = btnGroup.querySelector(`button[data-pagination="next"]`)
+        );
+        const btn = btnGroup.querySelector(`button[data-pagination="next"]`);
         btn.dataset.pagination = page;
         btn.disabled = false;
         btn.click();
         btn.dataset.pagination = `next`;
     }
-    
+
     function removeDynamicButton() {
         const btn = document.getElementById('dynamic-button');
         if (btn) btn.remove();
     }
-    
+
     function getActiveBtn() {
         return announcementsContainer.querySelector('button.btn.ghost.active');
     }
-    
+
     function getFirstBtn() {
         const btn = announcementsContainer.querySelector('button.btn.ghost[data-pagination="first"]');
         if (btn) btn.removeAttribute('disabled');
@@ -612,23 +700,24 @@ async function scrapeAnnouncements(transactions, directorInterests, historicalDo
         if (btn) btn.removeAttribute('disabled');
         return btn;
     }
-    
+
     function getActivePage() {
         const btn = getActiveBtn();
-        return Number(btn.dataset.pagination); // Consistent with selector
+        return Number(btn?.dataset.pagination);
     }
 
     async function calculateTotalAnnouncements() {
+        await checkPause(); // Check pause before calculating
         const lastPage = await new Promise((resolve, reject) => {
-            const clacObserver = new MutationObserver(() => {
-                clacObserver.disconnect();
+            const calcObserver = new MutationObserver(() => {
+                calcObserver.disconnect();
                 resolve(getActivePage());
             });
-        
-            clacObserver.observe(tableContainer, { childList: true, subtree: true });
+
+            calcObserver.observe(tableContainer, { childList: true, subtree: true });
             getLastBtn().click();
         });
-        totalAnnouncements = ((lastPage - 1) * 10) + tableContainer.querySelectorAll('tbody tr').length;
+        const totalAnnouncements = ((lastPage - 1) * 10) + tableContainer.querySelectorAll('tbody tr').length;
         getFirstBtn().click();
         return totalAnnouncements;
     }
@@ -636,38 +725,39 @@ async function scrapeAnnouncements(transactions, directorInterests, historicalDo
     async function retryFailedScrapedPages(failedPages, tableContainer, isFinished) {
         const MAX_RETRIES = 3;
         const retryCounts = new Map();
-    
+
         while (failedPages.length > 0 && !isFinished) {
             const failedPage = failedPages.shift();
             console.log(`🔄 Retrying failed page ${failedPage}`);
-    
+
             const retries = (retryCounts.get(failedPage) || 0) + 1;
             if (retries > MAX_RETRIES) {
                 console.error(`❌ Page ${failedPage} exceeded retry limit (${MAX_RETRIES})`);
                 continue;
             }
             retryCounts.set(failedPage, retries);
-    
+
             try {
                 await retryPage(failedPage, tableContainer);
             } catch (error) {
                 console.error(`❌ Failed to retry page ${failedPage} (attempt ${retries}):`, error);
-                failedPages.push(failedPage); // Requeue for retry
+                failedPages.push(failedPage);
             } finally {
-                removeDynamicButton(); // Always clean up
+                removeDynamicButton();
             }
         }
-    
+
         async function retryPage(page, container) {
+            await checkPause(); // Check pause before retrying
             return new Promise((resolve, reject) => {
                 let timeoutId = null;
                 const retryObserver = new MutationObserver(async (mutations, observer) => {
                     const activePage = getActivePage();
                     if (activePage !== page) return;
-    
+
                     observer.disconnect();
                     clearTimeout(timeoutId);
-    
+
                     try {
                         console.log(`ℹ️ Active page ${activePage} matches target ${page}, scraping...`);
                         await handlePageLoad(page);
@@ -676,9 +766,9 @@ async function scrapeAnnouncements(transactions, directorInterests, historicalDo
                         reject(error);
                     }
                 });
-    
+
                 retryObserver.observe(container, { childList: true, subtree: true });
-    
+
                 try {
                     paginateClick(page);
                 } catch (error) {
@@ -687,7 +777,7 @@ async function scrapeAnnouncements(transactions, directorInterests, historicalDo
                     reject(error);
                     return;
                 }
-    
+
                 timeoutId = setTimeout(() => {
                     retryObserver.disconnect();
                     const activePage = getActivePage();
@@ -702,7 +792,9 @@ async function scrapeAnnouncements(transactions, directorInterests, historicalDo
         }
     }
 
+    // Update sendScrapedBatch to use sendRuntimeMessage
     async function sendScrapedBatch(batch) {
+        await checkPause();
         const uniqueBatch = batch.filter((announcement) => {
             if (announcement.pdfLink) {
                 if (allPdfLinks.has(announcement.pdfLink)) {
@@ -714,75 +806,68 @@ async function scrapeAnnouncements(transactions, directorInterests, historicalDo
             }
             return true;
         });
-    
+
         if (uniqueBatch.length === 0) {
             console.log(`ℹ️ ${tickerSymbol} No new unique announcements to send in batch`);
             return Promise.resolve(true);
         }
 
         let attempt = 1;
-    
+
         while (attempt <= scrapedAnnouncementSendBatchMaxRetries) {
+            await checkPause();
             try {
                 const success = await new Promise((resolve) => {
                     const timeout = setTimeout(() => {
                         console.log(`❌ ${tickerSymbol} Timeout waiting for save_scraped_announcement_batch response (attempt ${attempt}/${scrapedAnnouncementSendBatchMaxRetries})`);
                         resolve(false);
                     }, 30000);
-    
-                    try {
-                        chrome.runtime.sendMessage({ action: "save_scraped_announcement_batch", batch: uniqueBatch }, (response) => {
+
+                    sendRuntimeMessage(
+                        { action: "save_scraped_announcement_batch", batch: uniqueBatch },
+                        (response) => {
                             clearTimeout(timeout);
-                            if (chrome.runtime.lastError) {
-                                console.log(`❌ ${tickerSymbol} Error sending batch: ${chrome.runtime.lastError.message} (attempt ${attempt}/${scrapedAnnouncementSendBatchMaxRetries})`);
+                            if (response?.success) {
+                                console.log(`✅ ${tickerSymbol} Saved batch of ${uniqueBatch.length} announcements (attempt ${attempt})`);
+                                resolve(true);
+                            } else {
+                                console.log(`❌ ${tickerSymbol} Failed to save batch: ${response?.error || 'Unknown error'} (attempt ${attempt})`);
                                 resolve(false);
-                                return;
                             }
-                            console.log(`✅ ${tickerSymbol} Sent batch of ${uniqueBatch.length} unique announcements (attempt ${attempt}/${scrapedAnnouncementSendBatchMaxRetries})`);
-                            resolve(response?.success || false);
-                        });
-                    } catch (error) {
-                        clearTimeout(timeout);
-                        console.error(`❌ ${tickerSymbol} Failed to send batch: ${error.message} (attempt ${attempt}/${scrapedAnnouncementSendBatchMaxRetries})`);
-                        resolve(false);
-                    }
+                        }
+                    );
                 });
-    
-                if (success) {
-                    return true;
-                }
-    
+
+                if (success) return true;
+
                 if (attempt < scrapedAnnouncementSendBatchMaxRetries) {
-                    console.log(`⏳ ${tickerSymbol} Retrying batch send in 5 seconds (attempt ${attempt + 1}/${scrapedAnnouncementSendBatchMaxRetries})`);
-                    await new Promise(resolve => setTimeout(resolve, scrapedAnnouncementSendBatchRetryTime)); // Wait 5 seconds
+                    console.log(`⏳ ${tickerSymbol} Retrying batch send in ${scrapedAnnouncementSendBatchRetryTime / 1000} seconds (attempt ${attempt + 1}/${scrapedAnnouncementSendBatchMaxRetries})`);
+                    await new Promise(resolve => setTimeout(resolve, scrapedAnnouncementSendBatchRetryTime));
                 } else {
-                    console.log(`❌ ${tickerSymbol} Max retries (${scrapedAnnouncementSendBatchMaxRetries}) reached, giving up on batch`);
+                    console.log(`❌ ${tickerSymbol} Max retries (${scrapedAnnouncementSendBatchMaxRetries}) reached, pausing`);
                     isPaused = true;
                     return false;
                 }
-    
+
                 attempt++;
             } catch (error) {
-                console.error(`❌ ${tickerSymbol} Unexpected error in sendBatch (attempt ${attempt}/${scrapedAnnouncementSendBatchMaxRetries}): ${error.message}`);
+                console.error(`❌ ${tickerSymbol} Unexpected error in sendScrapedBatch (attempt ${attempt}): ${error.message}`);
                 if (attempt < scrapedAnnouncementSendBatchMaxRetries) {
-                    console.log(`⏳ ${tickerSymbol} Retrying batch send in 5 seconds (attempt ${attempt + 1}/${scrapedAnnouncementSendBatchMaxRetries})`);
-                    await new Promise(resolve => setTimeout(resolve, scrapedAnnouncementSendBatchRetryTime)); // Wait 5 seconds
+                    await new Promise(resolve => setTimeout(resolve, scrapedAnnouncementSendBatchRetryTime));
                 } else {
-                    console.log(`❌ ${tickerSymbol} Max retries (${scrapedAnnouncementSendBatchMaxRetries}) reached, giving up on batch`);
                     isPaused = true;
                     return false;
                 }
                 attempt++;
             }
         }
-    
-        // Fallback in case loop exits unexpectedly
-        console.log(`❌ ${tickerSymbol} Batch send failed after retries, pausing`);
-        isPaused = true;
+
         return false;
     }
-    
+
     async function sendFinalScrapedData(transactions, directorInterests, historicalDownloadUrl, companyOverview, companyDetails, scrapedAnnouncements = []) {
+        await checkPause();
+        updateTabStatus(`Saving Final Scraped Data`);
         if (isFinished) {
             console.log(`Already finished for ${tickerSymbol}, skipping sendFinalScrapedData`);
             return;
@@ -790,17 +875,23 @@ async function scrapeAnnouncements(transactions, directorInterests, historicalDo
         isFinished = true;
     
         try {
-    
             if (Array.isArray(scrapedAnnouncements) && scrapedAnnouncements.length) {
                 console.log(`Sending final batch of ${scrapedAnnouncements.length} announcements`);
                 const success = await sendScrapedBatch(scrapedAnnouncements);
                 if (!success && isPaused) {
-                    await waitForResume(scrapedAnnouncements, transactions, directorInterests, historicalDownloadUrl, companyOverview, companyDetails);
+                    isFinished = false;
                     return;
                 }
             }
     
-            totalScrapeableAnnouncements = await calculateTotalAnnouncements();
+            if (webScrapeAnnouncements) {
+                updateTabStatus("Calculate Total Scrapeable Announcements");
+                totalScrapeableAnnouncements = await calculateTotalAnnouncements();
+                updateTabStatus("Finalizing Scrape");
+            } else {
+                totalScrapeableAnnouncements = 0;
+            }
+    
             const data = {
                 transactions,
                 director_interests: directorInterests,
@@ -810,37 +901,27 @@ async function scrapeAnnouncements(transactions, directorInterests, historicalDo
                 total_scrapeable_announcements: totalScrapeableAnnouncements,
                 total_api_fetchable_announcements: totalAPIFetchedAnnouncements
             };
-            console.log(`Sending scraping_complete message for ${tickerSymbol} with Total Scrapeable Announcements: ${totalScrapeableAnnouncements}`);
     
             const response = await new Promise((resolve) => {
                 const timeout = setTimeout(() => {
-                    console.log(`⚠️ ${tickerSymbol} Timeout waiting for scraping_complete response, assuming sent`);
+                    console.log(`⚠️ ${tickerSymbol} Timeout waiting for scraping_complete response`);
                     resolve({ success: false, error: "Timeout" });
                 }, 30000);
     
-                try {
-                    console.log(`Sending scraping_complete message for ${tickerSymbol}`);
-                    chrome.runtime.sendMessage({ action: "scraping_complete", data }, (response) => {
+                sendRuntimeMessage(
+                    { action: "scraping_complete", data },
+                    (response) => {
                         clearTimeout(timeout);
-                        if (chrome.runtime.lastError) {
-                            console.log(`❌ ${tickerSymbol} Error sending scraping_complete: ${chrome.runtime.lastError.message}`);
-                            resolve({ success: false, error: chrome.runtime.lastError.message });
-                            return;
-                        }
-                        console.log(`✅ ${tickerSymbol} Received response from background:`, response);
+                        console.log(`✅ ${tickerSymbol} Received response for scraping_complete:`, response);
                         resolve(response);
-                    });
-                } catch (error) {
-                    clearTimeout(timeout);
-                    console.error(`❌ ${tickerSymbol} Failed to send scraping_complete: ${error.message}`);
-                    resolve({ success: false, error: error.message });
-                }
+                    }
+                );
             });
     
             if (response.success === false) {
                 console.log(`❌ ${tickerSymbol} Scraping_complete failed: ${response.error}, pausing`);
                 isPaused = true;
-                await waitForResume(scrapedAnnouncements, transactions, directorInterests, historicalDownloadUrl, companyOverview, companyDetails);
+                isFinished = false;
                 return;
             } else if (response.error) {
                 console.log(`⚠️ ${tickerSymbol} Scraping completed with note: ${response.error}`);
@@ -850,110 +931,197 @@ async function scrapeAnnouncements(transactions, directorInterests, historicalDo
         } catch (error) {
             console.error(`❌ ${tickerSymbol} Error in sendFinalScrapedData: ${error.message}`);
             isPaused = true;
-            await waitForResume(scrapedAnnouncements, transactions, directorInterests, historicalDownloadUrl, companyOverview, companyDetails);
+            isFinished = false;
         }
     }
 
-    async function fetchAnnouncementsViaApi(tickerSymbol, apiFetchedAnnouncementSendBatchSize = 100) {
+    async function fetchAnnouncementsViaApi(tickerSymbol) {
+        console.log('fetchAnnouncementsViaApi');
+        if (!apiFetchAnnouncements) return;
+    
+        updateTabStatus("API Fetch Announcements");
         const apiUrl = `https://data-api.marketindex.com.au/api/v1/announcements?codes=${tickerSymbol.toUpperCase()}%3AAUD%3AXASX&limit=1000000`;
+    
         try {
-            const response = await fetch(apiUrl);
-            if (!response.ok) {
-                throw new Error(`HTTP error! Status: ${response.status}`);
-            }
-            const data = await response.json();
-            if (data.statusCode !== 200) {
-                throw new Error(data.message);
-            }
-            const announcements = data.data.announcements;
-            console.log(`📡 ${tickerSymbol} Fetched ${announcements.length} announcements via API`);
+            console.log('apiUrl', apiUrl);
+            const announcements = await fetchApiData(apiUrl, tickerSymbol);
+            console.log(`announcements`, announcements);
+            console.log(`📡 Fetched ${announcements.length} announcements via API`);
             totalAPIFetchedAnnouncements = announcements.length;
-            
-            // Send announcements in batches to background.js
-            for (let i = 0; i < announcements.length; i += apiFetchedAnnouncementSendBatchSize) {
-                const batch = announcements.slice(i, i + apiFetchedAnnouncementSendBatchSize);
-                // Add pdfLink for potential PDF downloads
-                const batchWithPdfLink = batch.map(ann => ({
-                    ...ann,
-                    tickerSymbol: tickerSymbol, // Ensure tickerSymbol is included
-                    pdfLink: `https://www.marketindex.com.au/${ann.fileKey}`
-                }));
+            await processAnnouncements(announcements, tickerSymbol);
+        } catch (error) {
+            console.error(`❌ ${tickerSymbol} Failed to fetch or process announcements: ${error.message}`);
+            if (apiFetchAnnouncementFailPause || apiFetchAnnouncementTimeoutFailPause) {
+                isPaused = true;
+                updateTabStatus("Paused: API Fetch Failed");
+            } else {
+                console.log(`⏭️ ${tickerSymbol} Skipping ticker due to API fetch failure`);
+            }
+        }
+    }
     
-                let attempt = 1;
+    async function fetchApiData(url, tickerSymbol) {
+        const maxErrorRetries = apiFetchAnnouncementMaxRetries;
+        const errorRetryTime = apiFetchAnnouncementRetryTime;
+        const maxTimeoutRetries = apiFetchAnnouncementTimeoutMaxRetries;
+        const timeoutRetryTime = apiFetchAnnouncementTimeoutRetryTime;
+        const timeoutMs = apiFetchAnnouncementTimeout;
+        let errorAttempt = 1;
+        let timeoutAttempt = 0; // Track timeout retries separately
+        let totalAttempts = 0; // Track total attempts to prevent infinite loops
+        const maxTotalAttempts = maxErrorRetries + maxTimeoutRetries; // Conservative limit
     
-                while (attempt <= apiFetchedAnnouncementMaxRetries) {
-                    try {
-                        const success = await new Promise((resolve) => {
-                            try {
-                                chrome.runtime.sendMessage({
-                                    action: "save_api_announcement_batch",
-                                    batch: batchWithPdfLink
-                                }, (response) => {
-                                    if (chrome.runtime.lastError) {
-                                        console.error(`❌ ${tickerSymbol} Error sending API batch: ${chrome.runtime.lastError.message} (attempt ${attempt}/${apiFetchedAnnouncementMaxRetries})`);
-                                        resolve(false);
-                                        return;
-                                    }
-                                    if (response?.success) {
-                                        console.log(`✅ ${tickerSymbol} Sent API batch of ${batchWithPdfLink.length} announcements (attempt ${attempt}/${apiFetchedAnnouncementMaxRetries})`);
-                                        resolve(true);
-                                    } else {
-                                        console.error(`❌ ${tickerSymbol} API batch failed: ${response?.error || 'Unknown error'} (attempt ${attempt}/${apiFetchedAnnouncementMaxRetries})`);
-                                        resolve(false);
-                                    }
-                                });
-                            } catch (error) {
-                                console.error(`❌ ${tickerSymbol} Failed to send API batch: ${error.message} (attempt ${attempt}/${apiFetchedAnnouncementMaxRetries})`);
-                                resolve(false);
-                            }
-                        });
+        console.log('fetchApiData');
     
-                        if (success) {
-                            break; // Exit retry loop on success
-                        }
+        while (totalAttempts < maxTotalAttempts) {
+            await checkPause();
+            totalAttempts++;
+            console.log(`[${tickerSymbol}] Fetch attempt ${totalAttempts} (error attempt ${errorAttempt}/${maxErrorRetries}, timeout attempt ${timeoutAttempt}/${maxTimeoutRetries})`);
     
-                        if (attempt < apiFetchedAnnouncementMaxRetries) {
-                            console.log(`⏳ ${tickerSymbol} Retrying API batch send in 5 seconds (attempt ${attempt + 1}/${apiFetchedAnnouncementMaxRetries})`);
-                            await new Promise(resolve => setTimeout(resolve, apiFetchedAnnouncementSendRetryTime)); // Wait 5 seconds
+            try {
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+    
+                const response = await Promise.race([
+                    fetch(url, { signal: controller.signal }),
+                    new Promise((_, reject) => setTimeout(() => reject(new Error('Fetch timeout')), timeoutMs))
+                ]);
+    
+                clearTimeout(timeoutId);
+    
+                if (!response.ok) {
+                    throw new Error(`HTTP error! Status: ${response.status}`);
+                }
+    
+                const data = await response.json();
+                console.log('data.statusCode', data.statusCode);
+                if (data.statusCode !== 200) {
+                    throw new Error(data.message);
+                }
+    
+                console.log(`📡 ${tickerSymbol} Fetched ${data.data.announcements.length} announcements via API`);
+                return data.data.announcements;
+            } catch (error) {
+                if (error.name === 'AbortError' || error.message === 'Fetch timeout') {
+                    timeoutAttempt++;
+                    console.error(`❌ ${tickerSymbol} API fetch timeout (timeout attempt ${timeoutAttempt}/${maxTimeoutRetries}): ${error.message}`);
+                    if (timeoutAttempt < maxTimeoutRetries) {
+                        console.log(`⏳ ${tickerSymbol} Retrying after timeout in ${timeoutRetryTime / 1000} seconds`);
+                        await delay(timeoutRetryTime);
+                        continue;
+                    } else {
+                        console.error(`❌ ${tickerSymbol} Max timeout retries (${maxTimeoutRetries}) reached`);
+                        if (apiFetchAnnouncementTimeoutFailPause) {
+                            isPaused = true;
+                            updateTabStatus("Paused: API Fetch Timeout");
+                            throw new Error(`Max timeout retries reached for ${tickerSymbol}`);
                         } else {
-                            console.log(`❌ ${tickerSymbol} Max retries (${apiFetchedAnnouncementMaxRetries}) reached for API batch, continuing`);
+                            console.log(`⏭️ ${tickerSymbol} Skipping ticker due to timeout failure`);
+                            throw new Error(`Max timeout retries reached, skipping ${tickerSymbol}`);
                         }
-    
-                        attempt++;
-                    } catch (error) {
-                        console.error(`❌ ${tickerSymbol} Unexpected error in API batch send (attempt ${attempt}/${apiFetchedAnnouncementMaxRetries}): ${error.message}`);
-                        if (attempt < apiFetchedAnnouncementMaxRetries) {
-                            console.log(`⏳ ${tickerSymbol} Retrying API batch send in 5 seconds (attempt ${attempt + 1}/${apiFetchedAnnouncementMaxRetries})`);
-                            await new Promise(resolve => setTimeout(resolve, apiFetchedAnnouncementSendRetryTime)); // Wait 5 seconds
+                    }
+                } else {
+                    errorAttempt++;
+                    console.error(`❌ ${tickerSymbol} API fetch error (error attempt ${errorAttempt}/${maxErrorRetries}): ${error.message}`);
+                    if (errorAttempt <= maxErrorRetries) {
+                        console.log(`⏳ ${tickerSymbol} Retrying after error in ${errorRetryTime / 1000} seconds`);
+                        await delay(errorRetryTime);
+                        timeoutAttempt = 0; // Reset timeout retries on error retry
+                        continue;
+                    } else {
+                        console.error(`❌ ${tickerSymbol} Max error retries (${maxErrorRetries}) reached`);
+                        if (apiFetchAnnouncementFailPause) {
+                            isPaused = true;
+                            updateTabStatus("Paused: API Fetch Error");
+                            throw new Error(`Max error retries reached for ${tickerSymbol}`);
                         } else {
-                            console.log(`❌ ${tickerSymbol} Max retries (${apiFetchedAnnouncementMaxRetries}) reached for API batch, continuing`);
+                            console.log(`⏭️ ${tickerSymbol} Skipping ticker due to error failure`);
+                            throw new Error(`Max error retries reached, skipping ${tickerSymbol}`);
                         }
-                        attempt++;
                     }
                 }
             }
-        } catch (error) {
-            console.error(`❌ ${tickerSymbol} Error fetching announcements via API: ${error.message}`);
+        }
+    
+        console.error(`❌ ${tickerSymbol} Exceeded total attempts (${maxTotalAttempts})`);
+        if (apiFetchAnnouncementTimeoutFailPause || apiFetchAnnouncementFailPause) {
+            isPaused = true;
+            updateTabStatus("Paused: API Fetch Failed");
+        }
+        throw new Error(`Failed to fetch API data for ${tickerSymbol} after ${maxTotalAttempts} attempts`);
+    }
+    
+    async function processAnnouncements(announcements, tickerSymbol) {
+        const batchSize = apiSaveFetchedAnnouncementSendBatchSize;
+        let batch_counter = 0;
+        for (let i = 0; i < announcements.length; i += batchSize) {
+            await checkPause();
+            batch_counter++;
+            const batch = announcements.slice(i, i + batchSize).map(ann => ({
+                ...ann,
+                tickerSymbol,
+                pdfLink: `https://www.marketindex.com.au/${ann.fileKey}`
+            }));
+            const success = await sendBatchToBackground(batch, tickerSymbol, batch_counter);
+            if (!success) {
+                console.error(`❌ ${tickerSymbol} Failed to send batch starting at index ${i}`);
+                if (apiSaveFetchedAnnouncementFailPause) {
+                    isPaused = true;
+                    updateTabStatus("Paused: Batch Send Failed");
+                }
+            }
         }
     }
     
-    await proceedToScrapeNextPage();
-}
-
-async function waitForResume(announcements, transactions, directorInterests, historicalDownloadUrl, companyOverview, companyDetails) {
-    console.log(`⏸️ ${tickerSymbol} Paused due to standby or error, waiting for resume`);
-    await new Promise((resolve) => {
-        chrome.runtime.onMessage.addListener(function listener(message) {
-            if (message.action === "resume_after_standby" && message.tickerSymbol === tickerSymbol) {
-                console.log(`▶️ ${tickerSymbol} Resuming after standby`);
-                chrome.runtime.onMessage.removeListener(listener);
-                isPaused = false;
-                resolve();
+    async function sendBatchToBackground(batch, tickerSymbol, batch_counter) {
+        const maxRetries = apiSaveFetchedAnnouncementMaxRetries;
+        const retryTime = apiSaveFetchedAnnouncementSendRetryTime;
+        let attempt = 1;
+    
+        while (attempt <= maxRetries) {
+            await checkPause();
+            updateTabStatus(`Save API Fetch Announcements Batch: ${batch_counter}, Contains: ${batch.length}, Attempt: ${attempt}/${maxRetries}`);
+    
+            const success = await new Promise((resolve) => {
+                sendRuntimeMessage(
+                    { action: "save_api_announcement_batch", batch: batch, batch_counter: batch_counter },
+                    (response) => {
+                        if (response?.success) {
+                            console.log(`✅ ${tickerSymbol} Saved API batch of ${batch.length} announcements`);
+                            resolve(true);
+                        } else {
+                            console.error(`❌ ${tickerSymbol} API batch: ${batch_counter} failed: ${response?.error || 'Unknown error'}`);
+                            console.error(`❌ ${tickerSymbol} API batch: ${batch_counter} failed response: ${response}`);
+                            console.dir(response, { depth: null });
+                            resolve(false);
+                        }
+                    }
+                );
+            });
+    
+            if (success) return true;
+    
+            if (attempt < maxRetries) {
+                updateTabStatus(`Retrying send batch ${batch_counter} in ${retryTime / 1000} s`);
+                await delay(retryTime);
+            } else {
+                console.error(`❌ ${tickerSymbol} Max retries (${maxRetries}) reached for send batch: ${batch_counter}`);
+                if (apiSaveFetchedAnnouncementFailPause) {
+                    isPaused = true;
+                }
+                return false;
             }
-        });
-    });
-    isFinished = false;
-    await sendFinalScrapedData(transactions, directorInterests, historicalDownloadUrl, companyOverview, companyDetails, announcements);
+            attempt++;
+        }
+    
+        return false;
+    }
+    
+    function delay(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    await proceedToScrapeNextPage();
 }
 
 async function waitForBackground() {
@@ -995,27 +1163,35 @@ async function waitForBackground() {
 }
 
 async function startScraping() {
-    if (!tickerSymbol) {
-        console.error("❌ No ticker symbol defined");
+    await checkPause(); // Check pause before starting
+    if (isScraping || !tickerSymbol) {
+        console.error(`❌ Scraping already in progress or no ticker symbol for ${tickerSymbol}`);
+        updateTabStatus("Error: Invalid state");
         return;
     }
+    isScraping = true;
     console.log(`🔍 Starting scraping for ${tickerSymbol}`);
+    updateTabStatus("Starting");
+    updateTabTicker(tickerSymbol);
     try {
         await waitForBackground().catch((error) => {
             console.error(`❌ Failed to connect to background script: ${error.message}`);
+            updateTabStatus(`Error: ${error.message}`);
             throw error;
         });
-    
-        // Use let if these might be modified, or ensure no reassignment
+
         let transactions = scrapeTransactions();
         let directorInterests = scrapeDirectorInterests();
         let historicalDownloadUrl = scrapeHistoricalDownloadUrl();
         let companyOverview = scrapeCompanyOverview();
         let companyDetails = scrapeCompanyDetails();
-    
+
+        updateTabStatus("Scraping data");
         await scrapeAnnouncements(transactions, directorInterests, historicalDownloadUrl, companyOverview, companyDetails);
+        updateTabStatus("Completed");
     } catch (error) {
         console.error(`❌ Scraping failed for ${tickerSymbol}: ${error.message}`);
+        updateTabStatus(`Error: ${error.message}`);
         try {
             console.log(`Sending scraping_complete message for ${tickerSymbol} with error`);
             chrome.runtime.sendMessage({ action: "scraping_complete", data: {} }, (response) => {
@@ -1026,6 +1202,8 @@ async function startScraping() {
         } catch (sendError) {
             console.error(`❌ Failed to send scraping_complete: ${sendError.message}`);
         }
+    } finally {
+        isScraping = false;
     }
 }
 

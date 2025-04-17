@@ -5,7 +5,7 @@
     <style>
         body {
             font-family: Arial, sans-serif;
-            width: 300px;
+            width: 400px; /* Increased width */
             padding: 10px;
         }
         label {
@@ -23,6 +23,29 @@
             margin-top: 10px;
             font-size: 14px;
         }
+        #tabTracking {
+            margin-top: 15px;
+            max-height: 300px; /* Limit height for scrolling */
+            overflow-y: auto; /* Enable scrolling */
+            border: 1px solid #ccc;
+            padding: 10px;
+        }
+        .tab-entry {
+            display: flex;
+            align-items: center;
+            margin-bottom: 10px;
+            padding: 5px;
+            border-bottom: 1px solid #eee;
+        }
+        .tab-entry span {
+            flex: 1;
+            margin-right: 10px;
+        }
+        .tab-entry button {
+            margin-left: 5px;
+            padding: 3px 8px;
+            font-size: 12px;
+        }
     </style>
 </head>
 <body>
@@ -32,11 +55,11 @@
         <input type="number" id="maxTabs" value="1" min="1" max="10">
     </label>
     <label>
-        <input type="checkbox" id="fetchViaApi" checked>
+        <input type="checkbox" id="apiFetchAnnouncements" checked>
         Fetch Announcements via API
     </label>
     <label>
-        <input type="checkbox" id="scrapeFromWeb" checked>
+        <input type="checkbox" id="webScrapeAnnouncements" checked>
         Scrape Announcements from Web
     </label>
     <label>
@@ -52,6 +75,9 @@
     <button id="resumeButton" disabled>Resume Scraping</button>
     <button id="updateConfigButton">Update Config</button>
     <div id="status">Idle</div>
+    <div id="tabTracking">
+        <!-- Tab entries will be dynamically added here -->
+    </div>
     <script src="popup.js"></script>
 </body>
 </html>

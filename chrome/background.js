@@ -1,17 +1,138 @@
-// Global state variables
 let isRunning = false;
 let isPaused = false;
-let currentMaxTabs = 0;
-let downloadPdfs = true;
-let closeTabs = true; // Default to true
-let fetchViaApi = true; // New setting
-let scrapeFromWeb = true; // New setting
-let activeTabs = new Set();
 let tickerQueue = [];
+let currentMaxTabs = 3;
+let activeTabs = new Set();
 let tabsToCloseGracefully = new Set();
-let batchCounters = {};
+let tabStates = new Map();
 let savedAPIAnnouncementsCount = {};
 let savedScrapedAnnouncementsCount = {};
+let downloadPdfs = true;
+let closeTabs = true;
+let apiFetchAnnouncements = true;
+let webScrapeAnnouncements = true;
+
+// Global resume signal for pause/resume state changes
+let resumeSignal = null;
+let resumeSignalResolver = null;
+
+// Function to reset resume signal when pause state changes
+function resetResumeSignal() {
+    resumeSignal = new Promise((resolve) => {
+        resumeSignalResolver = resolve;
+    });
+}
+
+// Initialize resume signal
+resetResumeSignal();
+
+(function() {
+    // Utility to wait for a delay
+    const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+    // Override chrome.runtime.sendMessage for critical messages with retries
+    const originalRuntimeSendMessage = chrome.runtime.sendMessage;
+    chrome.runtime.sendMessage = async function(message, callback, isCritical = false, ticker = '') {
+        if (!isCritical) {
+            originalRuntimeSendMessage(message, (response) => {
+                if (chrome.runtime.lastError) {
+                    // console.log(`${ticker} No listener (e.g., popup not open):`, chrome.runtime.lastError.message);
+                } else if (callback) {
+                    callback(response);
+                }
+            });
+            return;
+        }
+
+        let attempts = 0;
+        const maxAttempts = 3;
+        const delayMs = 3000;
+
+        while (attempts < maxAttempts) {
+            attempts++;
+            try {
+                await new Promise((resolve, reject) => {
+                    originalRuntimeSendMessage({ action: 'ping' }, response => {
+                        if (chrome.runtime.lastError) {
+                            reject(chrome.runtime.lastError);
+                        } else {
+                            resolve(response);
+                        }
+                    });
+                });
+
+                originalRuntimeSendMessage(message, response => {
+                    if (chrome.runtime.lastError) {
+                        console.warn(`[${ticker}] chrome.runtime.sendMessage failed: ${chrome.runtime.lastError.message}`);
+                        if (callback) callback(null);
+                    } else {
+                        if (callback) callback(response);
+                    }
+                });
+                return;
+            } catch (error) {
+                console.warn(`[${ticker}] Attempt ${attempts} failed for chrome.runtime.sendMessage: ${error.message}`);
+                if (attempts < maxAttempts) {
+                    await wait(delayMs);
+                } else {
+                    console.error(`[${ticker}] Giving up after ${maxAttempts} attempts for chrome.runtime.sendMessage`);
+                    if (callback) callback(null);
+                }
+            }
+        }
+    };
+
+    // Override chrome.tabs.sendMessage
+    const originalTabsSendMessage = chrome.tabs.sendMessage;
+    chrome.tabs.sendMessage = async function(tabId, message, callback) {
+        let attempts = 0;
+        const maxAttempts = 3;
+        const delayMs = 3000;
+
+        while (attempts < maxAttempts) {
+            attempts++;
+            try {
+                await new Promise((resolve, reject) => {
+                    chrome.tabs.get(tabId, tab => {
+                        if (chrome.runtime.lastError || !tab) {
+                            reject(new Error(`Tab ${tabId} does not exist`));
+                        } else {
+                            resolve();
+                        }
+                    });
+                });
+
+                await new Promise((resolve, reject) => {
+                    originalTabsSendMessage(tabId, { action: 'ping' }, response => {
+                        if (chrome.runtime.lastError) {
+                            reject(chrome.runtime.lastError);
+                        } else {
+                            resolve(response);
+                        }
+                    });
+                });
+
+                originalTabsSendMessage(tabId, message, response => {
+                    if (chrome.runtime.lastError) {
+                        console.warn(`chrome.tabs.sendMessage failed for tab ${tabId}: ${chrome.runtime.lastError.message}`);
+                        if (callback) callback(null);
+                    } else {
+                        if (callback) callback(response);
+                    }
+                });
+                return;
+            } catch (error) {
+                console.warn(`Attempt ${attempts} failed for chrome.tabs.sendMessage to tab ${tabId}: ${error.message}`);
+                if (attempts < maxAttempts) {
+                    await wait(delayMs);
+                } else {
+                    console.error(`Giving up after ${maxAttempts} attempts for chrome.tabs.sendMessage to tab ${tabId}`);
+                    if (callback) callback(null);
+                }
+            }
+        }
+    };
+})();
 
 console.log("Background script initializing...");
 
@@ -22,281 +143,423 @@ function normalizeTicker(ticker) {
     return ticker.endsWith('.AX') ? ticker : `${ticker}.AX`;
 }
 
-// Load settings from storage
-chrome.storage.local.get(["maxTabs", "downloadPdfs", "closeTabs", "fetchViaApi", "scrapeFromWeb"], (data) => {
-    if (data.maxTabs) currentMaxTabs = data.maxTabs;
-    if (data.downloadPdfs !== undefined) downloadPdfs = data.downloadPdfs;
-    if (data.closeTabs !== undefined) closeTabs = data.closeTabs;
-    if (data.fetchViaApi !== undefined) fetchViaApi = data.fetchViaApi;
-    if (data.scrapeFromWeb !== undefined) scrapeFromWeb = data.scrapeFromWeb;
-    console.log(`Loaded settings: maxTabs=${currentMaxTabs}, downloadPdfs=${downloadPdfs}, closeTabs=${closeTabs}, fetchViaApi=${fetchViaApi}, scrapeFromWeb=${scrapeFromWeb}`);
-});
+// Check global pause state and wait if paused
+async function checkPause(tabId = null, ticker = '') {
+    if (!isPaused) return; // No action if not paused
+
+    console.log(`⏸️ ${ticker || 'Background'} Paused, waiting to resume...`);
+    if (tabId && activeTabs.has(tabId)) {
+        const currentTabState = tabStates.get(tabId) || {};
+        if (!currentTabState.isPaused) {
+            tabStates.set(tabId, { ...currentTabState, isPaused: true });
+            sendUiUpdateMessage({ action: 'tab_paused', tabId }, false, ticker);
+            chrome.tabs.sendMessage(tabId, { action: 'pause_tab' }, (response) => {
+                if (chrome.runtime.lastError) {
+                    console.error(`Error sending pause_tab to tab ${tabId}: ${chrome.runtime.lastError.message}`);
+                }
+            });
+        }
+    }
+
+    await resumeSignal; // Wait for resume signal
+
+    console.log(`▶️ ${ticker || 'Background'} Resumed`);
+    if (tabId && activeTabs.has(tabId)) {
+        const currentTabState = tabStates.get(tabId) || {};
+        if (currentTabState.isPaused) {
+            tabStates.set(tabId, { ...currentTabState, isPaused: false });
+            sendUiUpdateMessage({ action: 'resume_tab', tabId }, false, ticker);
+            chrome.tabs.sendMessage(tabId, { action: 'resume_tab' }, (response) => {
+                if (chrome.runtime.lastError) {
+                    console.error(`Error sending resume_tab to tab ${tabId}: ${chrome.runtime.lastError.message}`);
+                }
+            });
+        }
+    }
+}
+
+// Function to send UI update messages without retries
+function sendUiUpdateMessage(message, critical = false, ticker = '') {
+    chrome.runtime.sendMessage(message, null, critical, ticker);
+}
+
+// Define allowed actions for background
+const backgroundActions = [
+    'ping',
+    'get_current_tab_id',
+    'get_status',
+    'get_tab_states',
+    'pause_tab',
+    'resume_tab',
+    'start_scraping',
+    'pause_scraping',
+    'resume_scraping',
+    'update_config',
+    'get_existing_files',
+    'get_download_announcements',
+    'api_fetch_announcements',
+    'web_scrap_announcements',
+    'save_api_announcement_batch',
+    'save_scraped_announcement_batch',
+    'scraping_complete',
+    'update_tab_status',
+    'update_tab_ticker',
+    'tab_paused'
+];
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-    console.log("Received message:", message);
+    const tabId = sender.tab?.id;
+    const senders_ticker = sender.tab?.url?.split("/")?.pop() || 'unknown';
 
-    // Handle ping for connection check
-    if (message.action === "ping") {
-        console.log("Ping received, responding with pong");
-        sendResponse({ status: "pong" });
-        return false; // Synchronous response
-    } else if (message.action === "initialize_system_active" && sender.tab?.id) {
-        console.log(`Initializing system active listener for tab ${sender.tab.id}`);
-        
-        sendResponse({ status: "initialized" });
-    } else if (message.action === "get_status") {
-        console.log("Sending status: isRunning=", isRunning, "isPaused=", isPaused);
-        sendResponse({ isRunning, isPaused });
-        return false; // Synchronous
-    } else if (message.action === "start_scraping") {
-        const newMaxTabs = message.maxTabs;
-        downloadPdfs = message.downloadPdfs !== undefined ? message.downloadPdfs : true;
-        closeTabs = message.closeTabs !== undefined ? message.closeTabs : true;
-        fetchViaApi = message.fetchViaApi !== undefined ? message.fetchViaApi : fetchViaApi; // Added
-        scrapeFromWeb = message.scrapeFromWeb !== undefined ? message.scrapeFromWeb : scrapeFromWeb; // Added
+    if (!message || !message.action) {
+        console.warn(`[${senders_ticker}] Invalid message received:`, message);
+        sendResponse({ success: false, error: "No action specified" });
+        return true;
+    }
 
-        if (!isRunning) {
-            isRunning = true;
-            currentMaxTabs = newMaxTabs;
-            savedAPIAnnouncementsCount = {}; // Reset counters on new scrape session
-            savedScrapedAnnouncementsCount = {}; // Reset counters on new scrape session
-            fetchTickersAndStartScraping()
-                .then(() => {
-                    console.log(`✅ Scraping started with ${currentMaxTabs} tabs, downloadPdfs: ${downloadPdfs}, closeTabs: ${closeTabs}, fetchViaApi: ${fetchViaApi}, scrapeFromWeb: ${scrapeFromWeb}`);
-                    chrome.runtime.sendMessage({ action: "status_update", isRunning: true, isPaused: false });
+    if (!backgroundActions.includes(message.action)) {
+        console.warn(`[${senders_ticker}] Unhandled message action: ${message.action}`);
+        sendResponse({ success: false, error: `BKG Unknown action: ${message.action}` });
+        return true;
+    }
+
+    switch (message.action) {
+        case 'ping':
+            sendResponse({ status: 'pong' });
+            break;
+        case 'get_current_tab_id':
+            sendResponse(tabId ? { tabId } : { error: 'No tab ID available' });
+            break;
+        case 'get_status':
+            sendResponse({ isRunning, isPaused });
+            break;
+        case 'get_tab_states':
+            sendResponse({ tabStates: Array.from(tabStates.entries()).map(([tabId, state]) => ({ tabId, ...state })) });
+            break;
+        case 'pause_tab':
+            if (message.tabId && activeTabs.has(message.tabId)) {
+                const currentTabState = tabStates.get(message.tabId) || {};
+                if (!currentTabState.isPaused) {
+                    tabStates.set(message.tabId, { ...currentTabState, isPaused: true });
+                    sendUiUpdateMessage({ action: 'tab_paused', tabId: message.tabId }, false, senders_ticker);
+                    chrome.tabs.sendMessage(message.tabId, { action: 'pause_tab' }, (response) => {
+                        if (chrome.runtime.lastError) {
+                            console.error(`[${senders_ticker}] Error pausing tab ${message.tabId}: ${chrome.runtime.lastError.message}`);
+                            sendResponse({ success: false, error: chrome.runtime.lastError.message });
+                        } else {
+                            sendResponse({ success: true });
+                        }
+                    });
+                } else {
                     sendResponse({ success: true });
-                })
-                .catch((error) => {
-                    console.error("Error starting scraping:", error);
-                    isRunning = false;
-                    sendResponse({ success: false, error: error.message });
+                }
+            } else {
+                console.warn(`[${senders_ticker}] Cannot pause tab ${message.tabId}: not active`);
+                sendResponse({ success: false, error: 'Tab not active' });
+            }
+            break;
+        case 'resume_tab':
+            if (message.tabId && activeTabs.has(message.tabId)) {
+                const currentTabState = tabStates.get(message.tabId) || {};
+                if (currentTabState.isPaused) {
+                    tabStates.set(message.tabId, { ...currentTabState, isPaused: false });
+                    sendUiUpdateMessage({ action: 'resume_tab', tabId: message.tabId }, false, senders_ticker);
+                    chrome.tabs.sendMessage(message.tabId, { action: 'resume_tab' }, (response) => {
+                        if (chrome.runtime.lastError) {
+                            console.error(`[${senders_ticker}] Error resuming tab ${message.tabId}: ${chrome.runtime.lastError.message}`);
+                            sendResponse({ success: false, error: chrome.runtime.lastError.message });
+                        } else {
+                            sendResponse({ success: true });
+                        }
+                    });
+                } else {
+                    sendResponse({ success: true });
+                }
+            } else {
+                sendResponse({ success: false, error: 'Tab not active' });
+            }
+            break;
+        case 'start_scraping':
+            if (!message || typeof message.maxTabs !== "number") {
+                console.error("Invalid start_scraping message:", message);
+                sendResponse({ success: false, error: "Missing or invalid maxTabs" });
+                return true;
+            }
+            const newMaxTabs = message.maxTabs;
+            downloadPdfs = message.downloadPdfs !== undefined ? message.downloadPdfs : true;
+            closeTabs = message.closeTabs !== undefined ? message.closeTabs : true;
+            apiFetchAnnouncements = message.apiFetchAnnouncements !== undefined ? message.apiFetchAnnouncements : apiFetchAnnouncements;
+            webScrapeAnnouncements = message.webScrapeAnnouncements !== undefined ? message.webScrapeAnnouncements : webScrapeAnnouncements;
+
+            if (!isRunning) {
+                isRunning = true;
+                currentMaxTabs = newMaxTabs;
+                activeTabs.clear();
+                tabStates.clear();
+                tabsToCloseGracefully.clear();
+                savedAPIAnnouncementsCount = {};
+                savedScrapedAnnouncementsCount = {};
+                console.log(`Starting scraping with maxTabs=${currentMaxTabs}`);
+                fetchTickersAndStartScraping()
+                    .then(() => {
+                        console.log(`✅ Scraping started with ${currentMaxTabs} tabs`);
+                        sendUiUpdateMessage({ action: "status_update", isRunning: true, isPaused: false }, false, senders_ticker);
+                        sendResponse({ success: true });
+                    })
+                    .catch((error) => {
+                        console.error("Error starting scraping:", error);
+                        isRunning = false;
+                        sendUiUpdateMessage({ action: "status_update", isRunning: false, isPaused: false }, false, senders_ticker);
+                        sendResponse({ success: false, error: error.message });
+                    });
+            } else {
+                currentMaxTabs = newMaxTabs;
+                adjustTabs()
+                    .then(() => {
+                        console.log(`🔄 Adjusted to ${currentMaxTabs} tabs`);
+                        sendUiUpdateMessage({ action: "status_update", isRunning: true, isPaused: false }, false, senders_ticker);
+                        sendResponse({ success: true });
+                    })
+                    .catch((error) => {
+                        console.error("Error adjusting tabs:", error);
+                        sendUiUpdateMessage({ action: "status_update", isRunning: true, isPaused: false }, false, senders_ticker);
+                        sendResponse({ success: false, error: error.message });
+                    });
+            }
+            break;
+        case 'pause_scraping':
+            if (!isPaused) {
+                isPaused = true;
+                resetResumeSignal(); // Reset signal for new pause
+                console.log("Scraping paused.");
+                tabStates.forEach((state, id) => {
+                    tabStates.set(id, { ...state, isPaused: true });
+                    sendUiUpdateMessage({ action: "tab_paused", tabId: id }, false, senders_ticker);
                 });
-        } else {
-            currentMaxTabs = newMaxTabs;
+                sendUiUpdateMessage({ action: "status_update", isRunning: true, isPaused: true }, false, senders_ticker);
+            }
+            sendResponse({ success: true });
+            break;
+        case 'resume_scraping':
+            if (isPaused) {
+                isPaused = false;
+                console.log("Scraping resumed.");
+                tabStates.forEach((state, id) => {
+                    tabStates.set(id, { ...state, isPaused: false });
+                    sendUiUpdateMessage({ action: "resume_tab", tabId: id }, false, senders_ticker);
+                });
+                processTickerQueue(message.delay);
+                sendUiUpdateMessage({ action: "status_update", isRunning: true, isPaused: false }, false, senders_ticker);
+                resumeSignalResolver(); // Resolve waiting checkPause calls
+                resetResumeSignal(); // Prepare for next pause
+            }
+            sendResponse({ success: true });
+            break;
+        case 'update_config':
+            const { maxTabs, downloadPdfs: dlAnns, closeTabs: clsTabs, apiFetchAnnouncements: fViaApi, webScrapeAnnouncements: sFromWeb } = message;
+            currentMaxTabs = maxTabs;
+            downloadPdfs = dlAnns !== undefined ? dlAnns : downloadPdfs;
+            closeTabs = clsTabs !== undefined ? clsTabs : closeTabs;
+            apiFetchAnnouncements = fViaApi !== undefined ? fViaApi : apiFetchAnnouncements;
+            webScrapeAnnouncements = sFromWeb !== undefined ? sFromWeb : webScrapeAnnouncements;
+            
+            console.log(`🔄 Config updated: maxTabs=${currentMaxTabs}`);
             adjustTabs()
                 .then(() => {
-                    console.log(`🔄 Adjusted to ${currentMaxTabs} tabs, downloadPdfs: ${downloadPdfs}, closeTabs: ${closeTabs}, fetchViaApi: ${fetchViaApi}, scrapeFromWeb: ${scrapeFromWeb}`);
-                    chrome.runtime.sendMessage({ action: "status_update", isRunning: true, isPaused: false });
                     sendResponse({ success: true });
                 })
                 .catch((error) => {
-                    console.error("Error adjusting tabs:", error);
+                    console.error("Error adjusting tabs after config update:", error);
                     sendResponse({ success: false, error: error.message });
                 });
-        }
-        return true; // Async response
-    } else if (message.action === "pause_scraping") {
-        isPaused = true;
-        console.log("Scraping paused.");
-        chrome.runtime.sendMessage({ action: "status_update", isRunning: true, isPaused: true });
-        sendResponse({ success: true });
-        return false; // Synchronous
-    } else if (message.action === "resume_scraping") {
-        isPaused = false;
-        console.log("Scraping resumed.");
-        processTickerQueue(message.delay);
-        chrome.runtime.sendMessage({ action: "status_update", isRunning: true, isPaused: false });
-        sendResponse({ success: true });
-        return false; // Synchronous
-    } else if (message.action === "update_config") {
-        const { maxTabs, downloadPdfs: dlAnns, closeTabs: clsTabs, fetchViaApi: fViaApi, scrapeFromWeb: sFromWeb } = message;
-        currentMaxTabs = maxTabs;
-        downloadPdfs = dlAnns !== undefined ? dlAnns : downloadPdfs;
-        closeTabs = clsTabs !== undefined ? clsTabs : closeTabs;
-        fetchViaApi = fViaApi !== undefined ? fViaApi : fetchViaApi; // Added
-        scrapeFromWeb = sFromWeb !== undefined ? sFromWeb : scrapeFromWeb; // Added
-        console.log(`🔄 Config updated: maxTabs=${currentMaxTabs}, downloadPdfs=${downloadPdfs}, closeTabs=${closeTabs}, fetchViaApi=${fetchViaApi}, scrapeFromWeb=${scrapeFromWeb}`);
-        adjustTabs()
-            .then(() => {
-                sendResponse({ success: true });
-            })
-            .catch((error) => {
-                console.error("Error adjusting tabs after config update:", error);
-                sendResponse({ success: false, error: error.message });
-            });
-        return true; // Async response
-    } else if (message.action === "get_existing_files") {
-        const tickerSymbol = message.tickerSymbol;
-        fetch(`http://127.0.0.1:5000/api/files/${tickerSymbol}`)
-            .then((response) => {
-                if (!response.ok) throw new Error(`HTTP error! Status: ${response.status}`);
-                return response.json();
-            })
-            .then((data) => {
-                console.log(`✅ ${tickerSymbol} Retrieved ${data.files.length} existing files`);
-                sendResponse({ files: data.files });
-            })
-            .catch((error) => {
-                console.error(`❌ ${tickerSymbol} Error fetching existing files: ${error.message}`);
-                sendResponse({ files: [] });
-            });
-        return true; // Async response
-    } else if (message.action === "get_download_announcements") {
-        console.log("Sending downloadPdfs:", downloadPdfs);
-        sendResponse({ downloadPdfs });
-        return false; // Synchronous
-    } else if (message.action === "get_fetch_via_api") {
-        console.log("Sending fetchViaApi:", fetchViaApi);
-        sendResponse({ fetchViaApi });
-        return false; // Synchronous
-    } else if (message.action === "get_scrape_from_web") {
-        console.log("Sending scrapeFromWeb:", scrapeFromWeb);
-        sendResponse({ scrapeFromWeb });
-        return false; // Synchronous
-    } else if (message.action === "save_api_announcement_batch") {
-        const { batch } = message;
-        const tickerSymbol = sender.tab.url.split("/").pop();
-        console.log(`${tickerSymbol} Received API announcement batch of ${batch.length} announcements`);
-        (async () => {
-            try {
-                savedAPIAnnouncementsCount[tickerSymbol] ??= 0;
-                // Send to server
-                const response = await fetch("http://127.0.0.1:5000/api/announcements_via_api", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ announcements: batch })
+            break;
+        case 'get_existing_files':
+            fetch(`http://127.0.0.1:5000/api/files/${message.tickerSymbol}`)
+                .then((response) => {
+                    if (!response.ok) throw new Error(`HTTP error! Status: ${response.status}`);
+                    return response.json();
+                })
+                .then((data) => {
+                    console.log(`✅ ${message.tickerSymbol} Retrieved ${data.files.length} existing files`);
+                    sendResponse({ files: data.files });
+                })
+                .catch((error) => {
+                    console.error(`❌ ${message.tickerSymbol} Error fetching existing files: ${error.message}`);
+                    sendResponse({ files: [] });
                 });
-                if (!response.ok) throw new Error(`Server error: ${response.status}`);
-                const result = await response.json();
-                if (result.status !== "success") throw new Error(result.error);
+            break;
+        case 'get_download_announcements':
+            sendResponse({ downloadPdfs });
+            break;
+        case 'api_fetch_announcements':
+            sendResponse({ apiFetchAnnouncements });
+            break;
+        case 'web_scrap_announcements':
+            sendResponse({ webScrapeAnnouncements });
+            break;
+        case 'save_api_announcement_batch':
+            (async () => {
+                try {
+                    const { batch, batch_counter } = message;
+                    const ticker = batch[0]?.tickerSymbol || senders_ticker;
+                    console.log(`[${ticker}] Saving API announcement batch: ${batch_counter}, contains: ${batch.length} announcements`);
+                    savedAPIAnnouncementsCount[ticker] ??= 0;
+                    const response = await fetch("http://127.0.0.1:5000/api/announcements_via_api", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ announcements: batch })
+                    });
+                    if (!response.ok) throw new Error(`Server error: ${response.status}`);
+                    const result = await response.json();
+                    if (result.status !== "success") throw new Error(result.error);
 
-                // Download PDFs if enabled
-                if (downloadPdfs) {
-                    for (const ann of batch) {
-                        if (ann.pdfLink) {
-                            await chrome.downloads.download({
-                                url: ann.pdfLink,
-                                filename: `announcements/${ann.tickerSymbol}/${ann.fileKey.split('/').pop()}`,
-                                conflictAction: "overwrite"
-                            });
-                        }
-                    }
-                }
-
-                savedAPIAnnouncementsCount[tickerSymbol] += batch.length;
-                sendResponse({ success: true });
-            } catch (error) {
-                console.error(`${tickerSymbol} Error saving API announcements:`, error);
-                sendResponse({ success: false, error: error.message });
-            }
-        })();
-        return true; // Indicate async response
-    } else if (message.action === "save_scraped_announcement_batch") {
-        const { batch } = message;
-        const tickerSymbol = sender.tab.url.split("/").pop();
-        console.log(`${tickerSymbol} Received batch of ${batch.length} announcements`);
-    
-        (async () => {
-            try {
-                const tickerSymbol = sender.tab.url.split("/").pop();
-                const announcementsWithTicker = batch.map(a => ({ ...a, tickerSymbol }));
-    
-                if (downloadPdfs) {
-                    for (let announcement of announcementsWithTicker) {
-                        if (announcement.pdfLink && !announcement.downloaded) {
-                            const relativeFilename = `announcements/${tickerSymbol}/${announcement.filename}`;
-                            console.log(`📥 ${tickerSymbol} Downloading PDF for ${announcement.filename}`);
-                            try {
-                                const headResponse = await Promise.race([
-                                    fetch(announcement.pdfLink, { method: "HEAD" }),
-                                    new Promise((_, reject) => setTimeout(() => reject(new Error("Validation timeout")), 5000))
-                                ]);
-                                if (!headResponse.ok || !headResponse.headers.get("Content-Type")?.includes("application/pdf")) {
-                                    throw new Error(`Invalid PDF (Status: ${headResponse.status})`);
-                                }
-                                console.log(`✅ ${tickerSymbol} PDF URL is valid`);
-                                const downloadId = await new Promise(resolve => chrome.downloads.download({
-                                    url: announcement.pdfLink,
-                                    filename: relativeFilename,
-                                    saveAs: false,
+                    if (downloadPdfs) {
+                        for (const ann of batch) {
+                            if (ann.pdfLink) {
+                                await chrome.downloads.download({
+                                    url: ann.pdfLink,
+                                    filename: `announcements/${ann.tickerSymbol}/${ann.fileKey.split('/').pop()}`,
                                     conflictAction: "overwrite"
-                                }, resolve));
-                                const downloadItem = await waitForDownload(downloadId);
-                                if (!downloadItem?.filename) throw new Error("Download failed");
-                                console.log(`✅ ${tickerSymbol} Downloaded PDF to ${downloadItem.filename}`);
-                                announcement.pdfLocalPath = downloadItem.filename;
-                                announcement.downloaded = true;
-                            } catch (e) {
-                                console.error(`❌ ${tickerSymbol} Error with PDF for ${announcement.filename}:`, e.message);
-                                announcement.pdfLocalPath = null;
+                                });
                             }
                         }
                     }
-                } else {
-                    console.log(`⏩ ${tickerSymbol} Skipping PDF downloads (disabled)`);
-                    announcementsWithTicker.forEach(a => a.pdfLocalPath = null);
+                    console.log(`[${ticker}] Announcement  batch: ${batch_counter} saved successfully`);
+                    savedAPIAnnouncementsCount[ticker] += batch.length;
+                    sendResponse({ success: true });
+                } catch (error) {
+                    console.error(`[${senders_ticker}] Error saving API announcements:`, error);
+                    sendResponse({ success: false, error: error.message });
                 }
-    
-                savedScrapedAnnouncementsCount[tickerSymbol] ??= 0;
-    
-                async function saveBatch() {
-                    try {
-                        const response = await fetch("http://127.0.0.1:5000/api/announcements", {
-                            method: "POST",
-                            headers: { "Content-Type": "application/json" },
-                            body: JSON.stringify({ announcements: announcementsWithTicker })
-                        });
-                        if (!response.ok) throw new Error(`HTTP error! Status: ${response.status}`);
-                        const result = await response.json();
-                        if (result.status !== "success") throw new Error(result.error);
-                        savedScrapedAnnouncementsCount[tickerSymbol] += announcementsWithTicker.length;
-                        console.log(`✅ ${tickerSymbol} Saved ${announcementsWithTicker.length} announcements, total: ${savedScrapedAnnouncementsCount[tickerSymbol]}`);
-                        return { success: true };
-                    } catch (error) {
-                        if (["fetch failed", "timeout", "connection", "Status: 500"].some(str => error.message.includes(str))) {
-                            console.log(`⏸️ ${tickerSymbol} Suspecting standby, awaiting wake`);
-                            await new Promise(resolve => {
-                                const listener = () => {
-                                    console.log(`▶️ ${tickerSymbol} System woke, retrying`);
-                                    chrome.runtime.onSuspendCanceled.removeListener(listener);
-                                    resolve();
-                                };
-                                chrome.runtime.onSuspendCanceled.addListener(listener);
-                            });
-                            return await saveBatch();
+            })();
+            break;
+        case 'save_scraped_announcement_batch':
+            const { batch } = message;
+            const ticker = batch[0]?.tickerSymbol || senders_ticker;
+            sendUiUpdateMessage({ action: 'update_tab_status', tabId, status: 'Save Scraped Announcement Batch' }, false, ticker);
+            console.log(`[${ticker}] Received batch of ${batch.length} announcements`);
+            (async () => {
+                try {
+                    const announcementsWithTicker = batch.map((a) => ({ ...a, tickerSymbol: ticker }));
+                    if (downloadPdfs) {
+                        for (let announcement of announcementsWithTicker) {
+                            if (announcement.pdfLink && !announcement.downloaded) {
+                                const relativeFilename = `announcements/${ticker}/${announcement.filename}`;
+                                console.log(`📥 ${ticker} Downloading PDF for ${announcement.filename}`);
+                                try {
+                                    const headResponse = await Promise.race([
+                                        fetch(announcement.pdfLink, { method: "HEAD" }),
+                                        new Promise((_, reject) => setTimeout(() => reject(new Error("Validation timeout")), 5000))
+                                    ]);
+                                    if (!headResponse.ok || !headResponse.headers.get("Content-Type")?.includes("application/pdf")) {
+                                        throw new Error(`Invalid PDF (Status: ${headResponse.status})`);
+                                    }
+                                    const downloadId = await new Promise((resolve) =>
+                                        chrome.downloads.download(
+                                            {
+                                                url: announcement.pdfLink,
+                                                filename: relativeFilename,
+                                                saveAs: false,
+                                                conflictAction: "overwrite"
+                                            },
+                                            resolve
+                                        )
+                                    );
+                                    const downloadItem = await waitForDownload(downloadId);
+                                    if (!downloadItem?.filename) throw new Error("Download failed");
+                                    announcement.pdfLocalPath = downloadItem.filename;
+                                    announcement.downloaded = true;
+                                } catch (e) {
+                                    console.error(`❌ ${ticker} Error with PDF for ${announcement.filename}:`, e.message);
+                                    announcement.pdfLocalPath = null;
+                                }
+                            }
                         }
-                        throw error;
                     }
-                }
-    
-                const result = await saveBatch();
-                if (!result.success) {
-                    console.log(`❌ ${tickerSymbol} Notifying popup of save failure`);
-                    chrome.runtime.sendMessage({
-                        action: "save_failed",
-                        batch: announcementsWithTicker,
-                        error: result.error,
-                        tabId: sender.tab?.id
-                    });
-                }
-                sendResponse(result);
-            } catch (error) {
-                console.error(`❌ ${tickerSymbol} Batch error:`, error.message);
-                sendResponse({ success: false, error: error.message });
-            }
-        })();
-    
-        return true; // Async response
-    } else if (message.action === "scraping_complete") {
-        (async () => {
-            const tickerSymbol = sender.tab.url.split("/").pop();
-            try {
 
-                await saveScrapedData(tickerSymbol, message.data);
+                    savedScrapedAnnouncementsCount[ticker] ??= 0;
+
+                    async function saveBatch() {
+                        try {
+                            const response = await fetch("http://127.0.0.1:5000/api/announcements", {
+                                method: "POST",
+                                headers: { "Content-Type": "application/json" },
+                                body: JSON.stringify({ announcements: announcementsWithTicker })
+                            });
+                            if (!response.ok) throw new Error(`HTTP error! Status: ${response.status}`);
+                            const result = await response.json();
+                            if (result.status !== "success") throw new Error(result.error);
+                            savedScrapedAnnouncementsCount[ticker] += announcementsWithTicker.length;
+                            console.log(`✅ ${ticker} Saved ${announcementsWithTicker.length} announcements`);
+                            return { success: true };
+                        } catch (error) {
+                            if (["fetch failed", "timeout", "connection", "Status: 500"].some((str) => error.message.includes(str))) {
+                                console.log(`⏸️ ${ticker} Suspecting standby, awaiting wake`);
+                                await new Promise((resolve) => {
+                                    const listener = () => {
+                                        console.log(`▶️ ${ticker} System woke, retrying`);
+                                        chrome.runtime.onSuspendCanceled.removeListener(listener);
+                                        resolve();
+                                    };
+                                    chrome.runtime.onSuspendCanceled.addListener(listener);
+                                });
+                                return await saveBatch();
+                            }
+                            throw error;
+                        }
+                    }
+
+                    const result = await saveBatch();
+                    sendResponse(result);
+                } catch (error) {
+                    console.error(`❌ ${ticker} Batch error:`, error);
+                    sendResponse({ success: false, error: error.message });
+                }
+            })();
+            break;
+        case 'scraping_complete':
+            (async () => {
+                try {
+                    const ticker = sender.tab?.url?.split("/")?.pop() || 'unknown';
+                    sendUiUpdateMessage({
+                        action: 'update_tab_status',
+                        tabId,
+                        status: 'Scraping Complete, Saving Data'
+                    }, false, ticker);
+                    await saveScrapedData(ticker, message.data, tabId);
+                    sendResponse({ success: true });
+                } catch (error) {
+                    console.error(`❌ ${senders_ticker} Error in scraping_complete:`, error);
+                    sendResponse({ success: false, error: error.message });
+                }
+            })();
+            break;
+        case 'update_tab_status':
+            if (tabId) {
+                tabStates.set(tabId, { ...tabStates.get(tabId) || { ticker: '', isPaused: false }, status: message.status });
+                sendUiUpdateMessage({ ...message, tabId }, false, senders_ticker);
                 sendResponse({ success: true });
-            } catch (error) {
-                console.error(`❌ ${tickerSymbol} Error in scraping_complete:`, error);
-                sendResponse({ success: false, error: error.message });
             }
-        })();
-
-        return true; // Async response
+            break;
+        case 'update_tab_ticker':
+            if (tabId) {
+                tabStates.set(tabId, { ...tabStates.get(tabId) || { status: 'Initializing', isPaused: false }, ticker: message.ticker.toUpperCase() });
+                sendUiUpdateMessage({ ...message, tabId }, false, senders_ticker);
+                sendResponse({ success: true });
+            }
+            break;
+        case 'tab_paused':
+            if (tabId) {
+                tabStates.set(tabId, { ...tabStates.get(tabId) || {}, isPaused: true });
+                sendUiUpdateMessage({ ...message, tabId }, false, senders_ticker);
+                sendResponse({ success: true });
+            }
+            break;
+        default:
+            sendResponse({ success: false, error: `BKG Unknown action: ${message.action}` });
     }
 
-    // Handle unhandled actions
-    console.warn(`Unhandled message action: ${message.action}`);
-    sendResponse({ success: false, error: `Unknown action: ${message.action}` });
-    return false; // Synchronous
+    return true;
 });
 
 chrome.runtime.onSuspendCanceled.addListener(() => {
@@ -314,6 +577,19 @@ chrome.runtime.onSuspendCanceled.addListener(() => {
             );
         });
     });
+});
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+    if (activeTabs.has(tabId)) {
+        activeTabs.delete(tabId);
+        tabStates.delete(tabId);
+        tabsToCloseGracefully.delete(tabId);
+        console.log(`🛑 Tab ${tabId} removed unexpectedly, cleaned up`);
+        sendUiUpdateMessage({ action: 'tab_closed', tabId });
+        if (tickerQueue.length > 0) {
+            adjustTabs();
+        }
+    }
 });
 
 async function downloadHistoricalData(tickerSymbol, data) {
@@ -373,13 +649,13 @@ async function waitForDownloadComplete(downloadId) {
     });
 }
 
-async function saveScrapedData(tickerSymbol, data) {
+async function saveScrapedData(tickerSymbol, data, tabId) {
     try {
         console.log(`Starting saveScrapedData for ${tickerSymbol} with data:`, data);
 
         const payload = {
             tickerSymbol: tickerSymbol,
-            updated_timestamps: {},
+            update_timestamps: {},
             company_overview: data.company_overview || {},
             company_details: data.company_details || {},
             transactions: data.transactions || {},
@@ -393,16 +669,23 @@ async function saveScrapedData(tickerSymbol, data) {
         const savedAPICount = savedAPIAnnouncementsCount[tickerSymbol] || 0;
         const savedScrapeCount = savedScrapedAnnouncementsCount[tickerSymbol] || 0;
 
-        if(fetchViaApi && savedAPICount === data.total_api_fetchable_announcements && data.total_api_fetchable_announcements > 0) {
-            payload.updated_timestamps.announcements_api_fetched_last_updated = true;
-            console.log(`🎉 ${tickerSymbol} Update 'announcements_api_fetched_last_updated', (${savedAPICount} API Fetched Announcements)`);
-            delete savedScrapedAnnouncementsCount[tickerSymbol];
+        if(apiFetchAnnouncements && savedAPICount === data.total_api_fetchable_announcements && data.total_api_fetchable_announcements > 0) {
+            payload.update_timestamps.announcements_api_fetched_last_updated = true;
+            console.log(`🎉 ${tickerSymbol} Update 'announcements_api_fetched_last_updated', (API Fetched: ${data.total_api_fetchable_announcements} match API Saved: ${savedAPICount})`);
         }
-        if(scrapeFromWeb && savedScrapeCount === data.total_scrapeable_announcements && data.total_scrapeable_announcements > 0) {
-            payload.updated_timestamps.announcements_scraped_last_updated = true;
-            console.log(`🎉 ${tickerSymbol} Update 'announcements_scraped_last_updated', (${savedScrapeCount} Scraped Announcements)`);
-            delete savedAPIAnnouncementsCount[tickerSymbol];
+        else {
+            console.log(`❌ ${tickerSymbol} Skip Update 'announcements_api_fetched_last_updated', (API Fetched: ${data.total_api_fetchable_announcements} does not match API Saved: ${savedAPICount})`);
         }
+        delete savedAPIAnnouncementsCount[tickerSymbol];
+        
+        if(webScrapeAnnouncements && savedScrapeCount === data.total_scrapeable_announcements && data.total_scrapeable_announcements > 0) {
+            payload.update_timestamps.announcements_scraped_last_updated = true;
+            console.log(`🎉 ${tickerSymbol} Update 'announcements_scraped_last_updated', (Scraped: ${data.total_scrapeable_announcements} match Scraped Saved: ${savedScrapeCount})`);
+        }
+        else {
+            console.log(`❌ ${tickerSymbol} Skip Update 'announcements_scraped_last_updated', (Scraped: ${data.total_scrapeable_announcements} does not match Scraped Saved: ${savedScrapeCount})`);
+        }
+        delete savedScrapedAnnouncementsCount[tickerSymbol];
 
         if (
             payload.historical_data_filepath ||
@@ -410,7 +693,7 @@ async function saveScrapedData(tickerSymbol, data) {
             Object.keys(payload.company_details).length ||
             payload.transactions.length ||
             payload.director_interests.length ||
-            payload.updated_timestamps.length
+            payload.update_timestamps.length
         ) {
             console.log(`Sending combined data for ${tickerSymbol}:`, payload);
             const response = await fetch("http://127.0.0.1:5000/save_data", {
@@ -419,6 +702,12 @@ async function saveScrapedData(tickerSymbol, data) {
                 body: JSON.stringify(payload)
             });
             const result = await response.json();
+            
+            sendUiUpdateMessage({
+                action: 'update_tab_status',
+                tabId: tabId,
+                status: 'Scraping Complete, Data Saved'
+            });
             console.log(`✅ ${tickerSymbol} Saved combined data:`, result);
         } else {
             console.log(`⏩ ${tickerSymbol} No data to save (empty payload)`);
@@ -443,27 +732,18 @@ async function fetchTickersAndStartScraping() {
     } catch (error) {
         console.error("Error fetching tickers:", error.message);
         isRunning = false;
-        chrome.runtime.sendMessage({ action: "status_update", isRunning: false, isPaused: false });
+        sendUiUpdateMessage({ action: "status_update", isRunning: false, isPaused: false }, false, 'unknown');
+        throw error;
     }
 }
 
 async function processTab(tabId) {
     const processedTickers = new Set();
-    while (tickerQueue.length > 0) {
+    while (tickerQueue.length > 0 && activeTabs.has(tabId)) {
         let tickerSymbol;
         try {
-            if (isPaused) {
-                await new Promise((resolve) => {
-                    const listener = (message) => {
-                        if (message.action === "resume_scraping") {
-                            chrome.runtime.onMessage.removeListener(listener);
-                            resolve();
-                        }
-                    };
-                    chrome.runtime.onMessage.addListener(listener);
-                });
-            }
-
+            // Check global pause state before processing ticker
+            await checkPause(tabId, 'Global');
             tickerSymbol = tickerQueue.shift();
 
             console.log(`🔄 Processing ticker ${tickerSymbol} in tab ${tabId}`);
@@ -478,6 +758,8 @@ async function processTab(tabId) {
             }
             processedTickers.add(tickerSymbol);
 
+            tabStates.set(tabId, { ticker: tickerSymbol.toUpperCase(), status: 'Initializing', isPaused: false });
+
             let url = `https://www.marketindex.com.au/asx/${tickerSymbol}`;
             console.log(`🚀 Updating tab ${tabId} for ${tickerSymbol}`);
 
@@ -485,10 +767,14 @@ async function processTab(tabId) {
             if (!tab) {
                 console.log(`Tab ${tabId} no longer exists. Stopping...`);
                 activeTabs.delete(tabId);
-                tabsToCloseGracefully.delete(tabId);
+                tabStates.delete(tabId);
+                sendUiUpdateMessage({ action: 'tab_closed', tabId }, false, tickerSymbol);
                 return;
             }
 
+            const delay = Math.floor(Math.random() * (2500 - 500 + 1)) + 500; // Random between 500 and 2500ms
+            await new Promise(resolve => setTimeout(resolve, delay + 3000));
+            
             await chrome.tabs.update(tabId, { url });
             await waitForTabLoad(tabId);
 
@@ -504,57 +790,52 @@ async function processTab(tabId) {
             }
 
             if (hasExpectedContent) {
-                const scrapedData = await executeScraping(tabId, tickerSymbol);
-                // await saveScrapedData(tickerSymbol, scrapedData);
+                await executeScraping(tabId, tickerSymbol);
             } else {
                 console.log(`Expected content not found for ${tickerSymbol}. Skipping...`);
             }
 
-            if (tabsToCloseGracefully.has(tabId)) {
-                console.log(`🛑 Tab ${tabId} finished current scrape, closing gracefully`);
+            // Clean up tab state after processing
+            if (tabsToCloseGracefully.has(tabId) || tickerQueue.length === 0) {
+                console.log(`🛑 Tab ${tabId} finished, closing`);
                 activeTabs.delete(tabId);
                 tabsToCloseGracefully.delete(tabId);
-                if (closeTabs) chrome.tabs.remove(tabId);
+                tabStates.delete(tabId);
+                if (closeTabs) {
+                    await chrome.tabs.remove(tabId);
+                    sendUiUpdateMessage({ action: 'tab_closed', tabId }, false, tickerSymbol);
+                }
                 return;
             }
         } catch (error) {
             console.error(`Error in tab ${tabId} for ticker ${tickerSymbol}:`, error);
-            if (tabsToCloseGracefully.has(tabId)) {
-                console.log(`🛑 Tab ${tabId} errored, closing gracefully`);
-                activeTabs.delete(tabId);
-                tabsToCloseGracefully.delete(tabId);
-                if (closeTabs) chrome.tabs.remove(tabId);
-                return;
+            activeTabs.delete(tabId);
+            tabStates.delete(tabId);
+            tabsToCloseGracefully.delete(tabId);
+            if (closeTabs) {
+                console.log(`🛑 Closing tab ${tabId} due to error`);
+                await chrome.tabs.remove(tabId);
+                sendUiUpdateMessage({ action: 'tab_closed', tabId }, false, tickerSymbol);
             }
+            return;
         }
 
-        console.log(`🏁 Completed ${tickerSymbol} in tab ${tabId}, checking next ticker`);
+        console.log(`🏁 Completed ${tickerSymbol} in tab ${tabId}`);
     }
 
     console.log(`✅ Tab ${tabId} finished processing queue`);
     activeTabs.delete(tabId);
+    tabStates.delete(tabId);
     if (closeTabs) {
-        console.log(`🛑 Closing tab ${tabId} as scraping is complete`);
-        chrome.tabs.remove(tabId);
-    } else {
-        console.log(`⏹️ Keeping tab ${tabId} open (closeTabs disabled)`);
+        console.log(`🛑 Closing tab ${tabId}`);
+        await chrome.tabs.remove(tabId);
+        sendUiUpdateMessage({ action: 'tab_closed', tabId });
     }
 
     if (activeTabs.size === 0 && tickerQueue.length === 0) {
         console.log("✅ All tabs finished and queue empty. Scraping complete.");
         isRunning = false;
-        try {
-            chrome.runtime.sendMessage(
-                { action: "status_update", isRunning: false, isPaused: false },
-                (response) => {
-                    if (chrome.runtime.lastError) {
-                        console.log("No listener for status_update (e.g., popup closed), continuing anyway:", chrome.runtime.lastError.message);
-                    }
-                }
-            );
-        } catch (error) {
-            console.error("Error sending status_update message:", error.message);
-        }
+        sendUiUpdateMessage({ action: "status_update", isRunning: false, isPaused: false });
     } else if (tickerQueue.length > 0) {
         console.log(`More tickers remain (${tickerQueue.length}), spawning new tab`);
         await adjustTabs();
@@ -562,16 +843,36 @@ async function processTab(tabId) {
 }
 
 async function adjustTabs() {
+    await checkPause(null, 'Global'); // Check global pause before adjusting tabs
     const targetTabs = Math.max(1, Math.min(currentMaxTabs, 10));
     const currentActive = activeTabs.size;
 
+    // Log current state for debugging
+    console.log(`Adjusting tabs: target=${targetTabs}, active=${currentActive}, tabStates=${tabStates.size}`);
+
+    // Remove stale tab states
+    for (let tabId of tabStates.keys()) {
+        if (!activeTabs.has(tabId)) {
+            console.log(`Cleaning stale tab state for tab ${tabId}`);
+            tabStates.delete(tabId);
+            sendUiUpdateMessage({ action: 'tab_closed', tabId });
+        }
+    }
+
     if (currentActive < targetTabs && tickerQueue.length > 0) {
         const tabsToCreate = Math.min(targetTabs - currentActive, tickerQueue.length);
+        console.log(`Creating ${tabsToCreate} new tabs`);
         for (let i = 0; i < tabsToCreate; i++) {
             try {
                 let tab = await chrome.tabs.create({ url: "about:blank", active: false });
                 activeTabs.add(tab.id);
+                tabStates.set(tab.id, { ticker: '', status: 'Initializing', isPaused: false });
                 console.log(`🌟 Created tab ${tab.id} for processing`);
+                sendUiUpdateMessage({
+                    action: 'update_tab_status',
+                    tabId: tab.id,
+                    status: 'Initializing'
+                });
                 processTab(tab.id);
                 await new Promise((resolve) => setTimeout(resolve, 500));
             } catch (error) {
@@ -580,9 +881,18 @@ async function adjustTabs() {
         }
     } else if (currentActive > targetTabs) {
         const tabsToClose = Array.from(activeTabs).slice(targetTabs);
+        console.log(`Closing ${tabsToClose.length} excess tabs`);
         for (let tabId of tabsToClose) {
+            activeTabs.delete(tabId);
+            tabStates.delete(tabId);
             tabsToCloseGracefully.add(tabId);
-            console.log(`⏳ Tab ${tabId} marked to close gracefully after current scrape`);
+            console.log(`⏳ Tab ${tabId} marked to close gracefully`);
+            try {
+                await chrome.tabs.remove(tabId);
+                sendUiUpdateMessage({ action: 'tab_closed', tabId });
+            } catch (error) {
+                console.error(`Failed to close tab ${tabId}:`, error);
+            }
         }
     }
 }
@@ -590,16 +900,33 @@ async function adjustTabs() {
 async function executeScraping(tabId, tickerSymbol) {
     console.log(`🔍 Executing scraping for ${tickerSymbol} (Tab ID: ${tabId})`);
     try {
-        // Inject content.js and wait for scraping_complete
+        // Set window.tabid in the tab's context
         await chrome.scripting.executeScript({
             target: { tabId },
-            files: ["content.js"]
+            func: (tabId) => {
+                window.tabid = tabId;
+            },
+            args: [tabId]
         });
-        console.log(`🔹 content.js injected into tab ${tabId}`);
-        
+        console.log(`🔹 Set window.tabid to ${tabId} in tab ${tabId}`);
+
+        // Check if content.js is already injected
+        const [result] = await chrome.scripting.executeScript({
+            target: { tabId },
+            func: () => typeof startScraping === 'function'
+        });
+        if (!result.result) {
+            await chrome.scripting.executeScript({
+                target: { tabId },
+                files: ["content.js"]
+            });
+            console.log(`🔹 content.js injected into tab ${tabId}`);
+        } else {
+            console.log(`🔹 content.js already present in tab ${tabId}`);
+        }
     } catch (error) {
         console.error(`🚨 Error during scraping for ${tickerSymbol}:`, error);
-        return { tickerSymbol, error: error.message };
+        throw error;
     }
 }
 

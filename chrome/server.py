@@ -307,7 +307,7 @@ def save_data():
         historical_data_filepath = data.get("historical_data_filepath")
         company_overview = data.get("company_overview", {})
         company_details = data.get("company_details", {})
-        updated_timestamps = data.get("updated_timestamps", {})
+        update_timestamps = data.get("update_timestamps", {})
 
         # Record scrape attempt and log result
         query = """UPDATE market_instruments SET last_scrape_attempt = CURRENT_TIMESTAMP WHERE ticker_symbol = %s"""
@@ -347,7 +347,7 @@ def save_data():
             """
             execute_values(cursor, query, deduped_data)
             logger.info(f"Saved {len(transactions)} transactions for {formatted_ticker_symbol}")
-            updated_timestamps["director_transactions_last_updated"] = True
+            update_timestamps["director_transactions_last_updated"] = True
 
         # Save director interests
         if director_interests:
@@ -366,7 +366,7 @@ def save_data():
             """
             execute_values(cursor, query, batch_data)
             logger.info(f"Saved {len(director_interests)} director interests for {formatted_ticker_symbol}")
-            updated_timestamps["director_interests_last_updated"] = True
+            update_timestamps["director_interests_last_updated"] = True
 
         # Save historical data from historical_data_filepath
         if historical_data_filepath:
@@ -434,7 +434,7 @@ def save_data():
                 """
                 execute_values(cursor, query, batch_data)
                 logger.info(f"Successfully saved {historical_records_saved}/{total_records} historical records for {formatted_ticker_symbol}")
-                updated_timestamps["historical_as_traded_last_updated"] = True
+                update_timestamps["historical_as_traded_last_updated"] = True
             elif total_records > 0:
                 conn.rollback()
                 return jsonify({"error": f"Failed to save historical data for {formatted_ticker_symbol}: no valid records processed"}), 500
@@ -469,29 +469,36 @@ def save_data():
                 formatted_ticker_symbol
             ))
             logger.info(f"Updated market_instruments with company overview and details for {formatted_ticker_symbol}")
+            update_timestamps["basic_fundamentals_last_updated"] = True
 
+        if len(update_timestamps) > 0:
 
+            # Define the list of timestamp columns
+            timestamp_columns = [
+                "basic_fundamentals_last_updated",
+                "director_transactions_last_updated",
+                "director_interests_last_updated",
+                "historical_as_traded_last_updated",
+                "announcements_api_fetched_last_updated",
+                "announcements_scraped_last_updated"
+            ]
 
-        if len(updated_timestamps) > 0:
+            # Filter columns to update where the key exists and its value is truthy
+            columns_to_update = [col for col in timestamp_columns if update_timestamps.get(col, False)]
 
-            updated_timestamps["director_transactions_last_updated"] = 'CURRENT_TIMESTAMP' if updated_timestamps.get("director_transactions_last_updated") else "null"
-            updated_timestamps["director_interests_last_updated"] = 'CURRENT_TIMESTAMP' if updated_timestamps.get("director_interests_last_updated") else "null"
-            updated_timestamps["historical_as_traded_last_updated"] = 'CURRENT_TIMESTAMP' if updated_timestamps.get("historical_as_traded_last_updated") else "null"
-            updated_timestamps["announcements_api_fetched_last_updated"] = 'CURRENT_TIMESTAMP' if updated_timestamps.get("announcements_api_fetched_last_updated") else "null"
-            updated_timestamps["announcements_scraped_last_updated"] = 'CURRENT_TIMESTAMP' if updated_timestamps.get("announcements_scraped_last_updated") else "null"
-
-            update_query = f"""
-                UPDATE market_instruments 
-                SET 
-                    director_transactions_last_updated = {updated_timestamps["director_transactions_last_updated"]},
-                    director_interests_last_updated = {updated_timestamps["director_interests_last_updated"]},
-                    historical_as_traded_last_updated = {updated_timestamps["historical_as_traded_last_updated"]},
-                    announcements_api_fetched_last_updated = {updated_timestamps["announcements_api_fetched_last_updated"]},
-                    announcements_scraped_last_updated = {updated_timestamps["announcements_scraped_last_updated"]}
-                WHERE ticker_symbol = %s
-            """
-            cursor.execute(update_query, (formatted_ticker_symbol, ))
-            logger.info(f"Updated market_instruments with company overview and details for {formatted_ticker_symbol}")
+            # Only proceed with the update if there are columns to update
+            if columns_to_update:
+                # Build the SET clause dynamically
+                set_clause = ", ".join([f"{col} = CURRENT_TIMESTAMP" for col in columns_to_update])
+                update_query = f"""
+                    UPDATE market_instruments 
+                    SET {set_clause}
+                    WHERE ticker_symbol = %s
+                """
+                cursor.execute(update_query, (formatted_ticker_symbol,))
+                logger.info(f"Updated market_instruments with updated timestamps for {columns_to_update}")
+            else:
+                logger.info(f"No timestamps to update for {formatted_ticker_symbol}")
 
 
         conn.commit()

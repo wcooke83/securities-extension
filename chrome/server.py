@@ -1,3 +1,4 @@
+# server.py
 import os
 import re
 import psycopg2
@@ -110,7 +111,7 @@ def get_existing_files(tickerSymbol):
             except Exception as e:
                 logger.error(f"Error closing connection in get_existing_files: {e}")
 
-@app.route("/api/announcements", methods=["POST"])
+@app.route("/api/announcements_via_dom", methods=["POST"])
 def save_announcements():
     conn = None
     try:

@@ -1,9 +1,21 @@
 {
+  "manifest_version": 3,
   "name": "ASX Scraper",
   "version": "1.0",
-  "manifest_version": 3,
-  "permissions": ["activeTab", "scripting", "tabs", "storage", "downloads"],
-  "host_permissions": ["https://www.marketindex.com.au/*", "https://data-api.marketindex.com.au/*"],
-  "background": { "service_worker": "background.js" },
-  "action": { "default_popup": "popup.html" }
+  "permissions": [
+    "tabs",
+    "activeTab",
+    "scripting",
+    "storage"
+  ],
+  "host_permissions": [
+    "https://www.marketindex.com.au/*",
+    "http://127.0.0.1:5000/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html"
+  }
 }

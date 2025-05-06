@@ -1074,13 +1074,13 @@ try {
             console.log('+++finalData+++');
             console.log(finalData);
             const res = await sendScrapedDataWithUserRetry(finalData);
-
             log(['TabLogs'], `Completed, Success: ${res.success}`, { tabId, tickerSymbol });
             updateTabStatus(`Completed, Success: ${res.success}`);
-            // await waitForBackground();
-
             isScraping = false;
-            sendMessage({ action: 'next_ticker'  });
+
+            if (!window.isAdHoc) {
+                sendMessage({ action: 'next_ticker' });
+            }
         }
 
         // Uncomment to start scraping immediately

@@ -121,6 +121,8 @@ document.addEventListener('DOMContentLoaded', () => {
     const webScrapeAnnouncementsCheckbox = document.getElementById('webScrapeAnnouncements');
     const downloadPdfsCheckbox = document.getElementById('downloadPdfs');
     const closeTabsCheckbox = document.getElementById('closeTabs');
+    const singleTickerInput = document.getElementById('singleTicker');
+    const scrapeSingleButton = document.getElementById('scrapeSingleButton');
     const statusDiv = document.getElementById('status');
     const tabTrackingDiv = document.getElementById('tabTracking');
 
@@ -208,30 +210,22 @@ document.addEventListener('DOMContentLoaded', () => {
         log(['GeneralLogs'], `Updated button states: isRunning=${isRunning}, isPaused=${isPaused}, status=${currentStatus}`);
     }
 
-    function updateTabStates(tabStatesArray) {
-        log(['DebugLogs', 'TabLogs'], `Updating tab states with: ${JSON.stringify(tabStatesArray)}`);
+    function updateTabStates(states) {
         tabTrackingDiv.innerHTML = '';
-        tabStates.clear();
-        if (!tabStatesArray || tabStatesArray.length === 0) {
-            log(['GeneralLogs'], 'No tab states to display');
-            tabTrackingDiv.innerHTML = '<div>No active tabs</div>';
-            return;
-        }
-        tabStatesArray.forEach(state => {
-            tabStates.set(state.tabId, state);
+        for (const [tabId, state] of Object.entries(states)) {
             const entry = document.createElement('div');
-            entry.id = `tab-${state.tabId}`;
             entry.className = 'tab-entry';
+            entry.dataset.tabId = tabId;
             entry.innerHTML = `
                 <span>Ticker: ${state.ticker || '-'}</span>
                 <span>Status: ${state.status || 'Initializing'}</span>
-                <button class="pause-tab" data-tabid="${state.tabId}" data-ticker="${state.ticker || ''}" ${state.isPaused ? 'disabled' : ''}>${state.isPaused ? 'Paused' : 'Pause'}</button>
-                <button class="resume-tab" data-tabid="${state.tabId}" data-ticker="${state.ticker || ''}" ${state.isPaused ? '' : 'disabled'}>Resume</button>
-                <button class="restart-tab" data-tabid="${state.tabId}" data-ticker="${state.ticker || ''}">Restart</button>
+                <button class="pause-tab" data-tabid="${tabId}" data-ticker="${state.ticker || ''}" ${state.isPaused ? 'disabled' : ''}>${state.isPaused ? 'Paused' : 'Pause'}</button>
+                <button class="resume-tab" data-tabid="${tabId}" data-ticker="${state.ticker || ''}" ${state.isPaused ? '' : 'disabled'}>Resume</button>
+                <button class="restart-tab" data-tabid="${tabId}" data-ticker="${state.ticker || ''}">Restart</button>
+                <button class="close-tab" data-tabid="${tabId}">Close</button>
             `;
             tabTrackingDiv.appendChild(entry);
-            log(['TabLogs'], `Added tab entry for tab ${state.tabId}: Ticker=${state.ticker}, Status=${state.status}`);
-        });
+        }
     }
 
     function updateTabEntry(tabId) {
@@ -343,30 +337,48 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     });
 
+    scrapeSingleButton.addEventListener('click', () => {
+        const ticker = singleTickerInput.value.trim().toUpperCase();
+        if (!ticker) {
+            alert('Please enter a ticker symbol.');
+            return;
+        }
+        sendMessage({ action: 'scrape_single_ticker', ticker }, (res) => {
+            if (res?.success) {
+                statusDiv.textContent = `Started scraping for ${ticker}`;
+            } else {
+                statusDiv.textContent = `Error: ${res?.error || 'Unknown'}`;
+            }
+        });
+    });
+
     tabTrackingDiv.addEventListener('click', (e) => {
         const tabId = parseInt(e.target.dataset.tabid);
         const tickerSymbol = e.target.dataset.ticker;
         if (!tabId) return;
+    
         if (e.target.classList.contains('pause-tab')) {
             log(['ActionLogs', 'TabLogs'], `Sending pause_tab for tab ${tabId}`);
             sendMessage({ action: 'pause_tab', tabId }, (res) => {
-                log(['DebugLogs'], `Received pause_tab response: ${JSON.stringify(res)}`);
                 if (res?.success) updateTabEntry(tabId);
             });
         } else if (e.target.classList.contains('resume-tab')) {
             log(['ActionLogs', 'TabLogs'], `Sending resume_tab for tab ${tabId}`);
             sendMessage({ action: 'resume_tab', tabId }, (res) => {
-                log(['DebugLogs'], `Received resume_tab response: ${JSON.stringify(res)}`);
                 if (res?.success) updateTabEntry(tabId);
             });
         } else if (e.target.classList.contains('restart-tab')) {
             log(['ActionLogs', 'TabLogs'], `Sending restart_tab for tab ${tabId}`);
             sendMessage({ action: 'restart_tab', tabId, tickerSymbol }, (res) => {
-                log(['DebugLogs'], `Received restart_tab response: ${JSON.stringify(res)}`);
                 if (res?.success) updateTabEntry(tabId);
             });
+        } else if (e.target.classList.contains('close-tab')) {
+            log(['ActionLogs', 'TabLogs'], `Sending close_tab for tab ${tabId}`);
+            sendMessage({ action: 'close_tab', tabId }, (res) => {
+                if (res?.success) removeTabEntry(tabId);
+            });
         }
-    });
+    })
 
     function getConfig() {
         const config = {

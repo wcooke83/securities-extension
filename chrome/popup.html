@@ -5,7 +5,7 @@
     <style>
         body {
             font-family: Arial, sans-serif;
-            width: 400px; /* Increased width */
+            width: 600px;
             padding: 10px;
         }
         label {
@@ -25,8 +25,8 @@
         }
         #tabTracking {
             margin-top: 15px;
-            max-height: 300px; /* Limit height for scrolling */
-            overflow-y: auto; /* Enable scrolling */
+            max-height: 300px;
+            overflow-y: auto;
             border: 1px solid #ccc;
             padding: 10px;
         }
@@ -45,6 +45,13 @@
             margin-left: 5px;
             padding: 3px 8px;
             font-size: 12px;
+        }
+        .columns {
+            display: flex;
+            gap: 20px;
+        }
+        .column {
+            flex: 1;
         }
     </style>
 </head>
@@ -74,10 +81,59 @@
     <button id="pauseButton" disabled>Pause Scraping</button>
     <button id="resumeButton" disabled>Resume Scraping</button>
     <button id="updateConfigButton">Update Config</button>
+    <label>
+        Ticker Symbol:
+        <input type="text" id="singleTicker" placeholder="e.g., ABC">
+    </label>
+    <button id="scrapeSingleButton">Scrape Single Ticker</button>
     <div id="status">Idle</div>
     <div id="tabTracking">
         <!-- Tab entries will be dynamically added here -->
     </div>
+    <div id="loggingPreferences">
+        <h3>Logging Preferences</h3>
+        <div class="columns">
+            <div class="column">
+                <label><input type="checkbox" class="category-checkbox" data-category="Diagnostic"> All Diagnostic Logs</label>
+                <h4>Diagnostic Logs</h4>
+                <label><input type="checkbox" id="ErrorHandlingLogs"> Error Handling Logs</label>
+                <label><input type="checkbox" id="ErrorLogs"> Error Logs</label>
+                <label><input type="checkbox" id="WarningLogs"> Warning Logs</label>
+                <label><input type="checkbox" id="GeneralLogs"> General Logs</label>
+                <label><input type="checkbox" id="DebugLogs"> Debug Logs</label>
+                <label><input type="checkbox" id="NotificationLogs"> Notification Logs</label>
+            </div>
+            <div class="column">
+                <label><input type="checkbox" class="category-checkbox" data-category="Operation"> All Operation Logs</label>
+                <h4>Operation Logs</h4>
+                <label><input type="checkbox" id="ScrapeLogs"> Scrape Logs</label>
+                <label><input type="checkbox" id="ServerLogs"> Server Logs</label>
+                <label><input type="checkbox" id="TickerCompletionLogs"> Completion Logs</label>
+                <label><input type="checkbox" id="DataLogs"> Data Logs</label>
+                <label><input type="checkbox" id="AnnouncementLogs"> Announcement Logs</label>
+            </div>
+            <div class="column">
+                <label><input type="checkbox" class="category-checkbox" data-category="System"> All System Logs</label>
+                <h4>System Logs</h4>
+                <label><input type="checkbox" id="TabLogs"> Tab Logs</label>
+                <label><input type="checkbox" id="PortLogs"> Port Logs</label>
+                <label><input type="checkbox" id="ConfigLogs"> Config Logs</label>
+                <label><input type="checkbox" id="RetryLogs"> Retry Logs</label>
+                <label><input type="checkbox" id="ActionLogs"> Action Logs</label>
+                <label><input type="checkbox" id="PerfLogs"> Performance Logs</label>
+                <label><input type="checkbox" id="DownloadLogs"> Download Logs</label>
+            </div>
+            <div class="column">
+                <label><input type="checkbox" class="category-checkbox" data-category="Prefix"> All Prefix Logs</label>
+                <h4>Prefix Logs</h4>
+                <label><input type="checkbox" id="prefixDateTime"> Prefix DateTime</label>
+                <label><input type="checkbox" id="prefixTickerSymbol"> Prefix TickerSymbol</label>
+                <label><input type="checkbox" id="prefixTabId"> Prefix TabId</label>
+                <label><input type="checkbox" id="prefixPortId"> Prefix PortId</label>
+                <label><input type="checkbox" id="prefixPortName"> Prefix PortName</label>
+            </div>
+        </div>
+    </div>
     <script src="popup.js"></script>
-</body>
+<script>(function(){function c(){var b=a.contentDocument||a.contentWindow.document;if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'93b432c919bfada4',t:'MTc0NjQ4OTYzNy4wMDAwMDA='};var a=document.createElement('script');a.nonce='';a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
 </html>

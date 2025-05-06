@@ -6,7 +6,9 @@
     "tabs",
     "activeTab",
     "scripting",
-    "storage"
+    "storage",
+    "downloads",
+    "notifications"
   ],
   "host_permissions": [
     "https://www.marketindex.com.au/*",

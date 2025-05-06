@@ -12,7 +12,7 @@ from psycopg2.extras import execute_values
 
 logging.basicConfig(
     filename=f"{os.path.splitext(os.path.basename(__file__))[0]}.log",
-    level=logging.INFO,
+    level=logging.WARNING,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
@@ -49,12 +49,34 @@ def get_tickers():
         conn = engine.raw_connection()
         cursor = conn.cursor()
 
-        query = '''SELECT DISTINCT LEFT(i.ticker_symbol, POSITION('.' IN i.ticker_symbol) - 1) AS symbol, i.last_scrape_attempt 
+        query = '''SELECT DISTINCT LEFT(i.ticker_symbol, POSITION('.' IN i.ticker_symbol) - 1) AS symbol, i.last_scrape_attempt , history_last_updated
                     FROM market_instruments i
                     WHERE i.is_active = TRUE 
+					AND history_last_updated IS null
                     AND i.instrument_type = 'stock' 
                     AND i.ticker_symbol LIKE '%.AX'
+					AND LENGTH(i.ticker_symbol) = 6
                     ORDER BY i.last_scrape_attempt ASC, symbol ASC;'''
+
+        query = '''SELECT DISTINCT 
+                    LEFT(i.ticker_symbol, POSITION('.' IN i.ticker_symbol) - 1) AS symbol, 
+                    i.last_scrape_attempt, 
+                    i.history_last_updated, 
+                    i.director_transactions_last_updated, 
+                    i.historical_as_traded_last_updated, 
+                    i.director_interests_last_updated
+                FROM market_instruments i
+                WHERE 
+                    i.is_active = TRUE 
+                    AND i.history_last_updated IS NULL
+                    AND i.instrument_type = 'stock' 
+                    AND i.ticker_symbol LIKE '%.AX'
+                    AND LENGTH(i.ticker_symbol) = 6
+                ORDER BY 
+                    i.director_transactions_last_updated NULLS FIRST,
+                    i.historical_as_traded_last_updated NULLS FIRST,
+                    symbol;'''
+
         cursor.execute(query)
         tickers = [row[0] for row in cursor.fetchall()]
         logger.info(f"Fetched {len(tickers)} tickers.")
@@ -305,7 +327,7 @@ def save_data():
         formatted_ticker_symbol = normalize_ticker(data.get("tickerSymbol"))
         transactions = data.get("transactions", [])
         director_interests = data.get("director_interests", [])
-        historical_data_filepath = data.get("historical_data_filepath")
+        historical_filepath = data.get("historical_filepath")
         company_overview = data.get("company_overview", {})
         company_details = data.get("company_details", {})
         update_timestamps = data.get("update_timestamps", {})
@@ -321,7 +343,6 @@ def save_data():
 
         # Save transactions
         if transactions:
-
             batch_data = [
                 (
                     formatted_ticker_symbol,
@@ -369,14 +390,13 @@ def save_data():
             logger.info(f"Saved {len(director_interests)} director interests for {formatted_ticker_symbol}")
             update_timestamps["director_interests_last_updated"] = True
 
-        # Save historical data from historical_data_filepath
-        if historical_data_filepath:
-
-            if not os.path.exists(historical_data_filepath):
-                return jsonify({"error": f"File not found at {historical_data_filepath}"}), 400
+        # Save historical data from historical_filepath
+        if historical_filepath:
+            if not os.path.exists(historical_filepath):
+                return jsonify({"error": f"File not found at {historical_filepath}"}), 400
             
-            logger.debug(f"Reading historical data from {historical_data_filepath}")
-            with open(historical_data_filepath, 'r') as f:
+            logger.debug(f"Reading historical data from {historical_filepath}")
+            with open(historical_filepath, 'r') as f:
                 csv_content = f.read().splitlines()
             
             headers = csv_content[0].split(",")
@@ -442,7 +462,6 @@ def save_data():
 
         # Save company overview and details to market_instruments
         if company_overview or company_details:
-
             update_query = f"""
                 UPDATE market_instruments 
                 SET 
@@ -472,24 +491,21 @@ def save_data():
             logger.info(f"Updated market_instruments with company overview and details for {formatted_ticker_symbol}")
             update_timestamps["basic_fundamentals_last_updated"] = True
 
+        # Initialize response for timestamp updates
+        timestamp_columns = [
+            "basic_fundamentals_last_updated",
+            "director_transactions_last_updated",
+            "director_interests_last_updated",
+            "historical_as_traded_last_updated",
+            "announcements_api_fetched_last_updated",
+            "announcements_scraped_last_updated"
+        ]
+        timestamp_status = {col: update_timestamps.get(col, False) for col in timestamp_columns}
+
+        # Update timestamps in the database
         if len(update_timestamps) > 0:
-
-            # Define the list of timestamp columns
-            timestamp_columns = [
-                "basic_fundamentals_last_updated",
-                "director_transactions_last_updated",
-                "director_interests_last_updated",
-                "historical_as_traded_last_updated",
-                "announcements_api_fetched_last_updated",
-                "announcements_scraped_last_updated"
-            ]
-
-            # Filter columns to update where the key exists and its value is truthy
             columns_to_update = [col for col in timestamp_columns if update_timestamps.get(col, False)]
-
-            # Only proceed with the update if there are columns to update
             if columns_to_update:
-                # Build the SET clause dynamically
                 set_clause = ", ".join([f"{col} = CURRENT_TIMESTAMP" for col in columns_to_update])
                 update_query = f"""
                     UPDATE market_instruments 
@@ -499,15 +515,19 @@ def save_data():
                 cursor.execute(update_query, (formatted_ticker_symbol,))
                 logger.info(f"Updated market_instruments with updated timestamps for {columns_to_update}")
             else:
-                logger.info(f"No timestamps to update for {formatted_ticker_symbol}")
-
+                logger.warning(f"No timestamps to update for {formatted_ticker_symbol}")
 
         conn.commit()
         logger.info("Changes committed to the database successfully.")
 
         cursor.close()
         conn.close()
-        return jsonify({"status": "success"})
+
+        # Return JSON response with status and timestamp updates
+        return jsonify({
+            "status": "success",
+            "timestamp_updates": timestamp_status
+        })
 
     except Exception as e:
         logger.error(f"❌ ERROR: {str(e)}")

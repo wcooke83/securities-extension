@@ -83,45 +83,75 @@ class PauseManager {
 const pauseManager = new PauseManager(tabId);
 
 // Log function that checks logging preferences
+
 function log(categories, message, context = {}) {
-
-    context.tickerSymbol = context.tickerSymbol || tickerSymbol || null;
-    context.tabId = context.tabId || tabId || null;
-
-    if (!loggingPrefs || Object.keys(loggingPrefs).length === 0) {
-        console.log('Logging before preferences loaded:', categories, message);
-        return;
-    }
     if (categories.some(cat => loggingPrefs[cat])) {
-        let pre_message = '';
-        if (loggingPrefs['prefixDateTime']) {
-            pre_message += `[${new Date().toISOString()}]`;
-        }
-        if (loggingPrefs['prefixTickerSymbol'] && context.tickerSymbol) {
-            pre_message += `[${context.tickerSymbol}]`;
-        }
-        if (loggingPrefs['prefixTabId'] && context.tabId) {
-            pre_message += `[${context.tabId}]`;
-        }
-        pre_message += pre_message.length > 0 ? ' - ' : '';
-        if (typeof message === 'string') {
-            const fullMessage = `${pre_message}${message}`;
-            if (categories.includes('ErrorLogs')) {
-                console.error(fullMessage);
-            } else if (categories.includes('WarningLogs')) {
-                console.warn(fullMessage);
-            } else {
-                console.log(fullMessage);
+        let pre_message = 'C';
+        if (loggingPrefs['prefixDateTime']) pre_message += `[${getClientLocalDateTime()}]`;
+        if (loggingPrefs['prefixTickerSymbol'] && context.tickerSymbol) pre_message += `[${context.tickerSymbol}]`;
+        if (loggingPrefs['prefixTabId'] && context.tabId) pre_message += `[${context.tabId}]`;
+        if (loggingPrefs['prefixPortName'] && context.portName) pre_message += `[${context.portName}]`;
+        pre_message += pre_message ? ' ' : '';
+
+        // Determine log method (default: console.log)
+        const logMethod = categories.includes('ErrorLogs') ? console.error :
+                         categories.includes('WarningLogs') ? console.warn :
+                         console.log;
+
+        // Handle objects & arrays
+        if (typeof message === 'object' && message !== null) {
+            let firstElement = '';
+            let remainingElements;
+
+            // Arrays: Extract & trim first string element
+            if (Array.isArray(message)) {
+                if (message.length > 0 && typeof message[0] === 'string') {
+                    firstElement = message[0].trim();
+                    remainingElements = message.slice(1);
+                } else {
+                    remainingElements = message;
+                }
             }
-        } else {
-            if (categories.includes('ErrorLogs')) {
-                console.error(pre_message, message);
-            } else if (categories.includes('WarningLogs')) {
-                console.warn(pre_message, message);
+            // Objects: Extract & trim first string property
+            else {
+                const keys = Object.keys(message);
+                if (keys.length > 0 && typeof message[keys[0]] === 'string') {
+                    firstElement = message[keys[0]].trim();
+                    remainingElements = { ...message };
+                    delete remainingElements[keys[0]];
+                } else {
+                    remainingElements = message;
+                }
+            }
+
+            // Combine pre_message + first trimmed element (if any)
+            const combinedMessage = pre_message + firstElement;
+            
+            // Log with remaining elements as separate args
+            if (firstElement) {
+                logMethod(combinedMessage, ...(Array.isArray(remainingElements) ? remainingElements : [remainingElements]));
             } else {
-                console.log(pre_message, message);
+                logMethod(pre_message, ...(Array.isArray(remainingElements) ? remainingElements : [remainingElements]));
             }
         }
+        // Handle primitives (strings, numbers, etc.)
+        else {
+            logMethod(`${pre_message}${message}`);
+        }
+    }
+}
+
+function getClientLocalDateTime() {
+    const now = new Date();
+    return now.toLocaleString(); // returns in local format based on client's browser settings
+}
+
+async function checkTabClosedByUser(tabId) {
+    try {
+        await chrome.tabs.get(tabId);
+        return false; // Tab exists, not closed
+    } catch (error) {
+        return true; // Tab not found, likely closed by user
     }
 }
 
@@ -186,10 +216,18 @@ function checkPage(tickerSymbol, callback) {
     log(['DebugLogs'], `${tickerSymbol} - Checking page for tab ${tabId}`);
 
     const title = document.title;
-    const h1 = document.querySelector('h1').textContent;
+    const h1Element = document.querySelector('h1');
+    const h1 = h1Element ? h1Element.textContent : '';
 
     log(['DebugLogs'], `${tickerSymbol} - Title: ${title}`);
     log(['DebugLogs'], `${tickerSymbol} - H1: ${h1}`);
+
+    // Check for 404 in H1 and skip if found
+    if (h1.includes('404')) {
+        log(['DebugLogs'], `${tickerSymbol} - H1 contains '404'. Calling skip404().`);
+        callback('404');
+        return;
+    }
 
     function verifyTitle() {
         const res = title.includes(`ASX:${tickerSymbol.toUpperCase()}`);
@@ -210,7 +248,7 @@ function checkPage(tickerSymbol, callback) {
     }
 
     if (verifyTitle() || verifyH1()) {
-        callback(true);
+        callback('ticker');
         return;
     }
 
@@ -223,9 +261,20 @@ function checkPage(tickerSymbol, callback) {
     const observer = new MutationObserver(() => {
         attempts++;
         setTimeout(() => {
+            const h1Updated = document.querySelector('h1');
+            const newH1 = h1Updated ? h1Updated.textContent : '';
+
+            // Re-check for 404 on mutations
+            if (newH1.includes('404')) {
+                log(['DebugLogs'], `${tickerSymbol} - H1 now contains '404'. Calling skip404().`);
+                observer.disconnect();
+                callback('404');
+                return;
+            }
+
             if (verifyTitle() || verifyH1()) {
                 observer.disconnect();
-                callback(true);
+                callback('ticker');
             } else if (attempts >= MAX_ATTEMPTS) {
                 observer.disconnect();
                 callback(false);
@@ -297,14 +346,14 @@ try {
     const apiSaveFetchedAnnouncementMaxRetries = 5;
     const apiSaveFetchedAnnouncementSendBatchSize = 500;
     const apiSaveFetchedAnnouncementSendRetryTime = 30000;
-    const apiSaveFetchedAnnouncementFailPause = true;
-    const apiFetchAnnouncementMaxRetries = 5;
-    const apiFetchAnnouncementRetryTime = 30000;
-    const apiFetchAnnouncementFailPause = true;
+    const apiSaveFetchedAnnouncementFailPause = false;
+    const apiFetchAnnouncementMaxRetries = 6;
+    const apiFetchAnnouncementRetryTime = 60000;
+    const apiFetchAnnouncementFailPause = false;
     const apiFetchAnnouncementTimeout = 30000;
-    const apiFetchAnnouncementTimeoutRetryTime = 10000;
-    const apiFetchAnnouncementTimeoutMaxRetries = 3;
-    const apiFetchAnnouncementTimeoutFailPause = true;
+    const apiFetchAnnouncementTimeoutRetryTime = 20000;
+    const apiFetchAnnouncementTimeoutMaxRetries = 6;
+    const apiFetchAnnouncementTimeoutFailPause = false;
     const scrapedAnnouncementScrapeMaxRetries = 5;
     const scrapedAnnouncementSendBatchMaxRetries = 5;
     const scrapedAnnouncementSendBatchRetryTime = 5000;
@@ -348,9 +397,17 @@ try {
                         break;
                     case 'check_page':
                         checkPage(msg.tickerSymbol, (success) => {
-                            sendMessage({ action: 'page_result', tabId, success });
-                            if (success) {
+
+                            if (success === 'ticker') {
+                                    
+                                sendMessage({ action: 'page_result', tabId, success: true });
                                 startScraping();
+                            } else if (success === '404' && !window.isAdHoc) {
+
+                                sendMessage({ action: 'next_ticker' });
+                            } else if (!success) {
+
+                                sendMessage({ action: 'next_ticker' });
                             }
                         });
                         break;
@@ -1075,7 +1132,7 @@ try {
             console.log(finalData);
             const res = await sendScrapedDataWithUserRetry(finalData);
             log(['TabLogs'], `Completed, Success: ${res.success}`, { tabId, tickerSymbol });
-            updateTabStatus(`Completed, Success: ${res.success}`);
+            updateTabStatus(`Completed: ${res.success ? 'Success' : 'Fail'}`);
             isScraping = false;
 
             if (!window.isAdHoc) {

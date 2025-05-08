@@ -1,6 +1,3 @@
-// Popup UI for Chrome Extension
-// This script handles the popup UI for the Chrome extension.
-// It includes functionality for logging preferences, tab management, and communication with the background script.
 const allCategories = [
     'ErrorLogs', 'WarningLogs', 'GeneralLogs', 'DebugLogs', 'ScrapeLogs', 'ServerLogs', 
     'TickerCompletionLogs', 'DataLogs', 'ErrorHandlingLogs', 'AnnouncementLogs', 'TabLogs', 
@@ -10,7 +7,6 @@ const allCategories = [
 ];
 let loggingPrefs = {};
 
-// Define category mappings
 const categoryMapping = {
     'Diagnostic': ['ErrorHandlingLogs', 'ErrorLogs', 'WarningLogs', 'GeneralLogs', 'DebugLogs', 'NotificationLogs'],
     'Operation': ['ScrapeLogs', 'ServerLogs', 'TickerCompletionLogs', 'DataLogs', 'AnnouncementLogs'],
@@ -18,7 +14,6 @@ const categoryMapping = {
     'Prefix': ['prefixDateTime', 'prefixTickerSymbol', 'prefixTabId', 'prefixPortId', 'prefixPortName']
 };
 
-// Reverse mapping for individual checkbox to category
 const idToCategory = {};
 for (const [category, ids] of Object.entries(categoryMapping)) {
     ids.forEach(id => idToCategory[id] = category);
@@ -68,20 +63,68 @@ chrome.storage.onChanged.addListener((changes, area) => {
     }
 });
 
-function log(categories, message) {
+function log(categories, message, context = {}) {
     if (categories.some(cat => loggingPrefs[cat])) {
-        const catStr = categories.join(',');
-        if (categories.includes('ErrorLogs') || categories.includes('ErrorHandlingLogs')) {
-            console.error(`[${catStr}] ${message}`);
-        } else if (categories.includes('WarningLogs')) {
-            console.warn(`[${catStr}] ${message}`);
+        let pre_message = 'P';
+        if (loggingPrefs['prefixDateTime']) pre_message += `[${getClientLocalDateTime()}]`;
+        if (loggingPrefs['prefixTickerSymbol'] && context.tickerSymbol) pre_message += `[${context.tickerSymbol}]`;
+        if (loggingPrefs['prefixTabId'] && context.tabId) pre_message += `[${context.tabId}]`;
+        if (loggingPrefs['prefixPortName'] && context.portName) pre_message += `[${context.portName}]`;
+        pre_message += pre_message ? ' ' : '';
+
+        const logMethod = categories.includes('ErrorLogs') ? console.error :
+                         categories.includes('WarningLogs') ? console.warn :
+                         console.log;
+
+        if (typeof message === 'object' && message !== null) {
+            let firstElement = '';
+            let remainingElements;
+
+            if (Array.isArray(message)) {
+                if (message.length > 0 && typeof message[0] === 'string') {
+                    firstElement = message[0].trim();
+                    remainingElements = message.slice(1);
+                } else {
+                    remainingElements = message;
+                }
+            } else {
+                const keys = Object.keys(message);
+                if (keys.length > 0 && typeof message[keys[0]] === 'string') {
+                    firstElement = message[keys[0]].trim();
+                    remainingElements = { ...message };
+                    delete remainingElements[keys[0]];
+                } else {
+                    remainingElements = message;
+                }
+            }
+
+            const combinedMessage = pre_message + firstElement;
+            
+            if (firstElement) {
+                logMethod(combinedMessage, ...(Array.isArray(remainingElements) ? remainingElements : [remainingElements]));
+            } else {
+                logMethod(pre_message, ...(Array.isArray(remainingElements) ? remainingElements : [remainingElements]));
+            }
         } else {
-            console.log(`[${catStr}] ${message}`);
+            logMethod(`${pre_message}${message}`);
         }
     }
 }
 
-// Event listeners for individual checkboxes
+function getClientLocalDateTime() {
+    const now = new Date();
+    return now.toLocaleString();
+}
+
+async function checkTabClosedByUser(tabId) {
+    try {
+        await chrome.tabs.get(tabId);
+        return false;
+    } catch (error) {
+        return true;
+    }
+}
+
 allCategories.forEach(cat => {
     const checkbox = document.getElementById(cat);
     if (checkbox) {
@@ -94,7 +137,6 @@ allCategories.forEach(cat => {
     }
 });
 
-// Event listeners for category checkboxes
 document.querySelectorAll('.category-checkbox').forEach(checkbox => {
     checkbox.addEventListener('change', (event) => {
         const category = event.target.dataset.category;
@@ -110,7 +152,6 @@ document.querySelectorAll('.category-checkbox').forEach(checkbox => {
     });
 });
 
-// Existing code below remains unchanged
 document.addEventListener('DOMContentLoaded', () => {
     const startButton = document.getElementById('startButton');
     const pauseButton = document.getElementById('pauseButton');
@@ -128,6 +169,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     let currentStatus = 'Idle';
     const tabStates = new Map();
+    let timerInterval = null;
 
     const port = chrome.runtime.connect({ name: 'popup' });
     let messageId = 0;
@@ -139,18 +181,18 @@ document.addEventListener('DOMContentLoaded', () => {
             callbacks.set(id, callback);
             setTimeout(() => {
                 if (callbacks.has(id)) {
-                    log(['ErrorLogs', 'PortLogs'], `Timeout waiting for response to message ID ${id}: ${JSON.stringify(message)}`);
+                    log(['ErrorLogs', 'PortLogs'], ['Timeout waiting for response to message ID ', id, ': ', message]);
                     callbacks.delete(id);
                     callback({ success: false, error: 'Response timeout' });
                 }
             }, timeout);
         }
-        log(['DebugLogs', 'PortLogs'], `Popup sending message (ID: ${id}): ${JSON.stringify(message)}`);
+        log(['DebugLogs', 'PortLogs'], ['Popup sending message (ID: ', id, '): ', message]);
         port.postMessage({ ...message, id });
     }
 
     port.onMessage.addListener((msg) => {
-        log(['DebugLogs', 'PortLogs'], `Popup received message: ${JSON.stringify(msg)}`);
+        log(['DebugLogs', 'PortLogs'], ['Popup received message: ', msg]);
         if (msg.id !== undefined && callbacks.has(msg.id)) {
             const cb = callbacks.get(msg.id);
             callbacks.delete(msg.id);
@@ -159,11 +201,11 @@ document.addEventListener('DOMContentLoaded', () => {
         } else {
             switch (msg.action) {
                 case 'status_update':
-                    log(['GeneralLogs'], `Processing status_update: ${JSON.stringify(msg)}`);
+                    log(['GeneralLogs'], ['Processing status_update: ', msg]);
                     updateButtonStates(msg.isRunning, msg.isPaused);
                     break;
                 case 'update_tab_states':
-                    log(['TabLogs'], `Processing update_tab_states: ${JSON.stringify(msg.data)}`);
+                    log(['TabLogs'], ['Processing update_tab_states: ', msg.data]);
                     updateTabStates(msg.data);
                     break;
                 case 'tab_paused':
@@ -180,6 +222,27 @@ document.addEventListener('DOMContentLoaded', () => {
                     log(['TabLogs'], `Processing tab_closed for tab ${msg.tabId}`);
                     removeTabEntry(msg.tabId);
                     break;
+                case 'tab_status_updated':
+                    log(['ActionLogs', 'TabLogs'], `Processing tab_status_updated for tab ${msg.tabId}`);
+                    tabStates.set(msg.tabId, { 
+                        ...tabStates.get(msg.tabId), 
+                        isPaused: msg.isPaused ?? tabStates.get(msg.tabId)?.isPaused,
+                        status: msg.status ?? tabStates.get(msg.tabId)?.status
+                    });
+                    updateTabEntry(msg.tabId);
+                    break;
+                case 'tab_states':
+                    log(['TabLogs'], ['Processing tab_states: ', msg.tabStates]);
+                    msg.tabStates.forEach((state) => {
+                        tabStates.set(state.tabId, {
+                            ticker: state.ticker,
+                            status: state.status,
+                            isPaused: state.isPaused,
+                            rowStartTime: Date.now()
+                        });
+                        updateTabEntry(state.tabId);
+                    });
+                    break;
                 default:
                     log(['WarningLogs'], `Unhandled message action: ${msg.action}`);
             }
@@ -189,6 +252,7 @@ document.addEventListener('DOMContentLoaded', () => {
     port.onDisconnect.addListener(() => {
         log(['ErrorLogs', 'PortLogs'], 'Popup port disconnected. Attempting to reconnect...');
         statusDiv.textContent = 'Error: Lost connection to background script';
+        if (timerInterval) clearInterval(timerInterval);
     });
 
     chrome.storage.local.get(['maxTabs', 'apiFetchAnnouncements', 'webScrapeAnnouncements', 'downloadPdfs', 'closeTabs'], (data) => {
@@ -197,7 +261,7 @@ document.addEventListener('DOMContentLoaded', () => {
         webScrapeAnnouncementsCheckbox.checked = data.webScrapeAnnouncements !== false;
         downloadPdfsCheckbox.checked = data.downloadPdfs !== false;
         closeTabsCheckbox.checked = data.closeTabs !== false;
-        log(['ConfigLogs'], `Loaded stored config: ${JSON.stringify(data)}`);
+        log(['ConfigLogs'], ['Loaded stored config: ', data]);
     });
 
     function updateButtonStates(isRunning, isPaused) {
@@ -210,22 +274,60 @@ document.addEventListener('DOMContentLoaded', () => {
         log(['GeneralLogs'], `Updated button states: isRunning=${isRunning}, isPaused=${isPaused}, status=${currentStatus}`);
     }
 
+    function formatTime(elapsedSeconds) {
+        if (elapsedSeconds < 60) {
+            return `${elapsedSeconds}s`;
+        } else {
+            const minutes = Math.floor(elapsedSeconds / 60);
+            const seconds = elapsedSeconds % 60;
+            return `${minutes}m ${seconds}s`;
+        }
+    }
+
+    function startTimerUpdates() {
+        if (timerInterval) clearInterval(timerInterval);
+        timerInterval = setInterval(() => {
+            tabStates.forEach((state, tabId) => {
+                const entry = document.getElementById(`tab-${tabId}`);
+                if (entry) {
+                    const timerSpan = entry.querySelector('.timer');
+                    if (timerSpan && state.rowStartTime) {
+                        const elapsedSeconds = Math.floor((Date.now() - state.rowStartTime) / 1000);
+                        timerSpan.textContent = formatTime(elapsedSeconds);
+                    }
+                }
+            });
+        }, 1000);
+    }
+
     function updateTabStates(states) {
         tabTrackingDiv.innerHTML = '';
-        for (const [tabId, state] of Object.entries(states)) {
+        log(['TabLogs'], [`updateTabStates states: `, states]);
+        for (const [id, state] of Object.entries(states)) {
+            const tabId = parseInt(state.tabId);
+            const existingState = tabStates.get(tabId);
+            tabStates.set(tabId, {
+                ticker: state.ticker,
+                status: state.status,
+                isPaused: state.isPaused,
+                rowStartTime: existingState ? existingState.rowStartTime : Date.now()
+            });
             const entry = document.createElement('div');
             entry.className = 'tab-entry';
-            entry.dataset.tabId = tabId;
+            entry.id = `tab-${state.tabId}`;
+            entry.dataset.tabId = state.tabId;
             entry.innerHTML = `
+                <span class="timer">${0}s</span>
                 <span>Ticker: ${state.ticker || '-'}</span>
                 <span>Status: ${state.status || 'Initializing'}</span>
-                <button class="pause-tab" data-tabid="${tabId}" data-ticker="${state.ticker || ''}" ${state.isPaused ? 'disabled' : ''}>${state.isPaused ? 'Paused' : 'Pause'}</button>
-                <button class="resume-tab" data-tabid="${tabId}" data-ticker="${state.ticker || ''}" ${state.isPaused ? '' : 'disabled'}>Resume</button>
-                <button class="restart-tab" data-tabid="${tabId}" data-ticker="${state.ticker || ''}">Restart</button>
-                <button class="close-tab" data-tabid="${tabId}">Close</button>
+                <button class="pause-tab" data-tabid="${state.tabId}" data-ticker="${state.ticker || ''}" ${state.isPaused ? 'disabled' : ''}>${state.isPaused ? '❚❚' : '❚❚'}</button>
+                <button class="resume-tab" data-tabid="${state.tabId}" data-ticker="${state.ticker || ''}" ${state.isPaused ? '' : 'disabled'}>➤</button>
+                <button class="restart-tab" data-tabid="${state.tabId}" data-ticker="${state.ticker || ''}">↻</button>
+                <button class="close-tab" data-tabid="${state.tabId}" data-ticker="${state.ticker || ''}">🗙</button>
             `;
             tabTrackingDiv.appendChild(entry);
         }
+        startTimerUpdates();
     }
 
     function updateTabEntry(tabId) {
@@ -236,12 +338,15 @@ document.addEventListener('DOMContentLoaded', () => {
         }
         const entry = document.getElementById(`tab-${tabId}`);
         if (entry) {
+            const elapsedSeconds = state.rowStartTime ? Math.floor((Date.now() - state.rowStartTime) / 1000) : 0;
             entry.innerHTML = `
+                <span class="timer">${formatTime(elapsedSeconds)}</span>
                 <span>Ticker: ${state.ticker || '-'}</span>
                 <span>Status: ${state.status || 'Initializing'}</span>
-                <button class="pause-tab" data-tabid="${tabId}" data-ticker="${state.ticker || ''}" ${state.isPaused ? 'disabled' : ''}>${state.isPaused ? 'Paused' : 'Pause'}</button>
-                <button class="resume-tab" data-tabid="${tabId}" data-ticker="${state.ticker || ''}" ${state.isPaused ? '' : 'disabled'}>Resume</button>
-                <button class="restart-tab" data-tabid="${state.tabId}" data-ticker="${state.ticker || ''}">Restart</button>
+                <button class="pause-tab" data-tabid="${tabId}" data-ticker="${state.ticker || 'Unknown'}" ${state.isPaused ? 'disabled' : ''}>${state.isPaused ? '❚❚' : '❚❚'}</button>
+                <button class="resume-tab" data-tabid="${tabId}" data-ticker="${state.ticker || 'Unknown'}" ${state.isPaused ? '' : 'disabled'}>➤</button>
+                <button class="restart-tab" data-tabid="${tabId}" data-ticker="${state.ticker || 'Unknown'}">↻</button>
+                <button class="close-tab" data-tabid="${tabId}" data-ticker="${state.ticker || 'Unknown'}">🗙</button>
             `;
             log(['TabLogs'], `Updated tab entry for tab ${tabId}: Ticker=${state.ticker}, Status=${state.status}`);
         }
@@ -254,6 +359,10 @@ document.addEventListener('DOMContentLoaded', () => {
             log(['TabLogs'], `Removed tab entry for tab ${tabId}`);
         }
         tabStates.delete(tabId);
+        if (tabStates.size === 0 && timerInterval) {
+            clearInterval(timerInterval);
+            timerInterval = null;
+        }
     }
 
     async function getValidTabId() {
@@ -271,9 +380,9 @@ document.addEventListener('DOMContentLoaded', () => {
             attempts++;
             log(['DebugLogs'], `Requesting tab states (attempt ${attempts})`);
             sendMessage({ action: 'get_tab_states' }, (res) => {
-                log(['DebugLogs', 'TabLogs'], `Received response for get_tab_states (attempt ${attempts}): ${JSON.stringify(res)}`);
+                log(['DebugLogs', 'TabLogs'], ['Received response for get_tab_states (attempt ', attempts, '): ', res]);
                 if (res?.tabStates) {
-                    log(['GeneralLogs'], `Tab states received, updating UI: ${JSON.stringify(res.tabStates)}`);
+                    log(['GeneralLogs'], ['Tab states received, updating UI: ', res.tabStates]);
                     updateTabStates(res.tabStates);
                 } else if (attempts < maxRetries) {
                     log(['RetryLogs'], `No tab states received, retrying in ${retryDelay}ms...`);
@@ -294,9 +403,9 @@ document.addEventListener('DOMContentLoaded', () => {
         chrome.storage.local.set(config, () => {
             const msg = { action: 'start_scraping', ...config };
             if (tabId) msg.tabId = tabId;
-            log(['ActionLogs', 'ConfigLogs'], `Sending start_scraping message: ${JSON.stringify(msg)}`);
+            log(['ActionLogs', 'ConfigLogs'], ['Sending start_scraping message: ', msg]);
             sendMessage(msg, (res) => {
-                log(['DebugLogs'], `Received start_scraping response: ${JSON.stringify(res)}`);
+                log(['DebugLogs'], ['Received start_scraping response: ', res]);
                 if (res?.success) {
                     updateButtonStates(true, false);
                 } else {
@@ -309,7 +418,7 @@ document.addEventListener('DOMContentLoaded', () => {
     pauseButton.addEventListener('click', () => {
         log(['ActionLogs'], 'Sending pause_scraping message');
         sendMessage({ action: 'pause_scraping' }, (res) => {
-            log(['DebugLogs'], `Received pause_scraping response: ${JSON.stringify(res)}`);
+            log(['DebugLogs'], ['Received pause_scraping response: ', res]);
             if (res?.success) updateButtonStates(true, true);
         });
     });
@@ -317,7 +426,7 @@ document.addEventListener('DOMContentLoaded', () => {
     resumeButton.addEventListener('click', () => {
         log(['ActionLogs'], 'Sending resume_scraping message');
         sendMessage({ action: 'resume_scraping' }, (res) => {
-            log(['DebugLogs'], `Received resume_scraping response: ${JSON.stringify(res)}`);
+            log(['DebugLogs'], ['Received resume_scraping response: ', res]);
             if (res?.success) updateButtonStates(true, false);
         });
     });
@@ -328,9 +437,9 @@ document.addEventListener('DOMContentLoaded', () => {
         chrome.storage.local.set(config, () => {
             const msg = { action: 'update_config', ...config };
             if (tabId) msg.tabId = tabId;
-            log(['ActionLogs', 'ConfigLogs'], `Sending update_config message: ${JSON.stringify(msg)}`);
+            log(['ActionLogs', 'ConfigLogs'], ['Sending update_config message: ', msg]);
             sendMessage(msg, (res) => {
-                log(['DebugLogs'], `Received update_config response: ${JSON.stringify(res)}`);
+                log(['DebugLogs'], ['Received update_config response: ', res]);
                 if (res?.success) statusDiv.textContent = 'Config Updated';
                 else statusDiv.textContent = `Error: ${res?.error || 'Unknown'}`;
             });
@@ -338,14 +447,14 @@ document.addEventListener('DOMContentLoaded', () => {
     });
 
     scrapeSingleButton.addEventListener('click', () => {
-        const ticker = singleTickerInput.value.trim().toUpperCase();
-        if (!ticker) {
+        const tickerSymbol = singleTickerInput.value.trim().toUpperCase();
+        if (!tickerSymbol) {
             alert('Please enter a ticker symbol.');
             return;
         }
-        sendMessage({ action: 'scrape_single_ticker', ticker }, (res) => {
+        sendMessage({ action: 'scrape_single_ticker', tickerSymbol }, (res) => {
             if (res?.success) {
-                statusDiv.textContent = `Started scraping for ${ticker}`;
+                statusDiv.textContent = `Started scraping for ${tickerSymbol}`;
             } else {
                 statusDiv.textContent = `Error: ${res?.error || 'Unknown'}`;
             }
@@ -353,32 +462,53 @@ document.addEventListener('DOMContentLoaded', () => {
     });
 
     tabTrackingDiv.addEventListener('click', (e) => {
-        const tabId = parseInt(e.target.dataset.tabid);
-        const tickerSymbol = e.target.dataset.ticker;
-        if (!tabId) return;
-    
-        if (e.target.classList.contains('pause-tab')) {
-            log(['ActionLogs', 'TabLogs'], `Sending pause_tab for tab ${tabId}`);
-            sendMessage({ action: 'pause_tab', tabId }, (res) => {
-                if (res?.success) updateTabEntry(tabId);
+        const target = e.target;
+        if (target.tagName !== 'BUTTON') return;
+
+        const tabId = parseInt(target.dataset.tabid, 10);
+        const tickerSymbol = target.dataset.ticker;
+        if (isNaN(tabId) || tabId <= 0 || !tickerSymbol || tickerSymbol === 'Unknown') {
+            log(['ErrorLogs', 'TabLogs'], `Invalid tabId or tickerSymbol: tabId=${tabId}, tickerSymbol=${tickerSymbol}`);
+            return;
+        }
+        if (target.classList.contains('pause-tab')) {
+            log(['ActionLogs', 'TabLogs'], `Sending pause_tab for tab ${tabId}, ticker ${tickerSymbol}`);
+            sendMessage({ action: 'pause_tab', tabId, tickerSymbol }, (res) => {
+                if (res?.success) {
+                    updateTabEntry(tabId);
+                } else {
+                    log(['ErrorLogs', 'TabLogs'], `Pause failed for tab ${tabId}: ${res?.error || 'Unknown'}`);
+                }
             });
-        } else if (e.target.classList.contains('resume-tab')) {
-            log(['ActionLogs', 'TabLogs'], `Sending resume_tab for tab ${tabId}`);
-            sendMessage({ action: 'resume_tab', tabId }, (res) => {
-                if (res?.success) updateTabEntry(tabId);
+        } else if (target.classList.contains('resume-tab')) {
+            log(['ActionLogs', 'TabLogs'], `Sending resume_tab for tab ${tabId}, ticker ${tickerSymbol}`);
+            sendMessage({ action: 'resume_tab', tabId, tickerSymbol }, (res) => {
+                if (res?.success) {
+                    updateTabEntry(tabId);
+                } else {
+                    log(['ErrorLogs', 'TabLogs'], `Resume failed for tab ${tabId}: ${res?.error || 'Unknown'}`);
+                }
             });
-        } else if (e.target.classList.contains('restart-tab')) {
-            log(['ActionLogs', 'TabLogs'], `Sending restart_tab for tab ${tabId}`);
+        } else if (target.classList.contains('restart-tab')) {
+            log(['ActionLogs', 'TabLogs'], `Sending restart_tab for tab ${tabId}, ticker ${tickerSymbol}`);
             sendMessage({ action: 'restart_tab', tabId, tickerSymbol }, (res) => {
-                if (res?.success) updateTabEntry(tabId);
+                if (res?.success) {
+                    updateTabEntry(tabId);
+                } else {
+                    log(['ErrorLogs', 'TabLogs'], `Restart failed for tab ${tabId}: ${res?.error || 'Unknown'}`);
+                }
             });
-        } else if (e.target.classList.contains('close-tab')) {
-            log(['ActionLogs', 'TabLogs'], `Sending close_tab for tab ${tabId}`);
-            sendMessage({ action: 'close_tab', tabId }, (res) => {
-                if (res?.success) removeTabEntry(tabId);
+        } else if (target.classList.contains('close-tab')) {
+            log(['ActionLogs', 'TabLogs'], `Sending close_tab for tab ${tabId}, ticker ${tickerSymbol}`);
+            sendMessage({ action: 'close_tab', tabId, tickerSymbol }, (res) => {
+                if (res?.success) {
+                    removeTabEntry(tabId);
+                } else {
+                    log(['ErrorLogs', 'TabLogs'], `Close failed for tab ${tabId}: ${res?.error || 'Unknown'}`);
+                }
             });
         }
-    })
+    });
 
     function getConfig() {
         const config = {
@@ -388,14 +518,14 @@ document.addEventListener('DOMContentLoaded', () => {
             downloadPdfs: downloadPdfsCheckbox.checked,
             closeTabs: closeTabsCheckbox.checked
         };
-        log(['ConfigLogs'], `Generated config: ${JSON.stringify(config)}`);
+        log(['ConfigLogs'], ['Generated config: ', config]);
         return config;
     }
 
     log(['GeneralLogs'], 'Popup initialized, requesting initial states');
     requestTabStatesWithRetry();
     sendMessage({ action: 'get_status' }, (res) => {
-        log(['DebugLogs'], `Received get_status response: ${JSON.stringify(res)}`);
+        log(['DebugLogs'], ['Received get_status response: ', res]);
         updateButtonStates(res?.isRunning || false, res?.isPaused || false);
     });
 });

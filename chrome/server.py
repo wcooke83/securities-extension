@@ -58,24 +58,36 @@ def get_tickers():
 					AND LENGTH(i.ticker_symbol) = 6
                     ORDER BY i.last_scrape_attempt ASC, symbol ASC;'''
 
-        query = '''SELECT DISTINCT 
-                    LEFT(i.ticker_symbol, POSITION('.' IN i.ticker_symbol) - 1) AS symbol, 
-                    i.last_scrape_attempt, 
-                    i.history_last_updated, 
-                    i.director_transactions_last_updated, 
-                    i.historical_as_traded_last_updated, 
-                    i.director_interests_last_updated
-                FROM market_instruments i
-                WHERE 
-                    i.is_active = TRUE 
-                    AND i.history_last_updated IS NULL
-                    AND i.instrument_type = 'stock' 
-                    AND i.ticker_symbol LIKE '%.AX'
-                    AND LENGTH(i.ticker_symbol) = 6
-                ORDER BY 
-                    i.director_transactions_last_updated NULLS FIRST,
-                    i.historical_as_traded_last_updated NULLS FIRST,
-                    symbol;'''
+        query = '''WITH ranked_instruments AS (
+                        SELECT 
+                            LEFT(i.ticker_symbol, POSITION('.' IN i.ticker_symbol) - 1) AS symbol, 
+                            i.ticker_symbol AS full_ticker_symbol,
+                            i.last_scrape_attempt, 
+                            i.history_last_updated, 
+                            i.director_transactions_last_updated, 
+                            i.historical_as_traded_last_updated, 
+                            i.director_interests_last_updated,
+                            i.is_active,
+                            ROW_NUMBER() OVER (PARTITION BY i.ticker_symbol ORDER BY last_scrape_attempt NULLS FIRST) as rn
+                        FROM market_instruments i
+                        WHERE 
+                            i.is_active = TRUE 
+                            AND i.history_last_updated IS NULL
+                            AND i.instrument_type = 'stock' 
+                            AND i.ticker_symbol LIKE '%.AX'
+                            AND LENGTH(i.ticker_symbol) = 6
+                    )
+                    SELECT 
+                        symbol,
+                        last_scrape_attempt,
+                        history_last_updated,
+                        director_transactions_last_updated,
+                        historical_as_traded_last_updated,
+                        director_interests_last_updated,
+                        is_active
+                    FROM ranked_instruments
+                    WHERE rn = 1
+                    ORDER BY last_scrape_attempt NULLS FIRST;'''
 
         cursor.execute(query)
         tickers = [row[0] for row in cursor.fetchall()]
@@ -393,45 +405,66 @@ def save_data():
         # Save historical data from historical_filepath
         if historical_filepath:
             if not os.path.exists(historical_filepath):
-                return jsonify({"error": f"File not found at {historical_filepath}"}), 400
+                # return jsonify({"error": f"File not found at {historical_filepath}"}), 400
+                logger.error(f"Error: File not found at {historical_filepath}")
+            
             
             logger.debug(f"Reading historical data from {historical_filepath}")
             with open(historical_filepath, 'r') as f:
                 csv_content = f.read().splitlines()
             
-            headers = csv_content[0].split(",")
+            headers = [h.strip() for h in csv_content[0].split(",")]
             historical_records_saved = 0
             total_records = len(csv_content) - 1
             batch_data = []
+
+            # Determine column indices based on header
+            try:
+                date_col = headers.index('Date')
+                symbol_col = headers.index('Symbol') if 'Symbol' in headers else None
+                open_col = headers.index('Open')
+                high_col = headers.index('High')
+                low_col = headers.index('Low')
+                close_col = headers.index('Close')
+                volume_col = headers.index('Volume')
+            except ValueError as e:
+                # return jsonify({"error": f"CSV file is missing required column: {str(e)}"}), 400
+                logger.error(f"Missing required column in header: {str(e)}")
 
             for line in csv_content[1:]:
                 if not line.strip():
                     total_records -= 1
                     continue
-                values = line.split(",")
+                
+                values = [v.strip() for v in line.split(",")]
                 if len(values) != len(headers):
                     total_records -= 1
                     continue
                 
                 try:
-                    date = clean_date(values[0])
+                    # Use the column indices we determined from the header
+                    date = clean_date(values[date_col])
                     if not date:
-                        logger.warning(f"Invalid date '{values[0]}' in historical record, skipping...")
+                        logger.warning(f"Invalid date '{values[date_col]}' in historical record, skipping...")
                         continue
-                    open_price = float(values[1])
-                    high = float(values[2])
-                    low = float(values[3])
-                    close = float(values[4])
-                    volume = int(values[5])
+                    
+                    # If symbol exists in CSV, use it (otherwise use formatted_ticker_symbol from elsewhere)
+                    symbol = values[symbol_col] if symbol_col is not None else formatted_ticker_symbol
+                    
+                    open_price = float(values[open_col])
+                    high = float(values[high_col])
+                    low = float(values[low_col])
+                    close = float(values[close_col])
+                    volume = int(values[volume_col])
 
                     batch_data.append((
-                        formatted_ticker_symbol,
+                        symbol,
                         date,
                         open_price,
                         high,
                         low,
                         close,
-                        None,
+                        None,  # adj_close (not in source data)
                         volume
                     ))
                     historical_records_saved += 1
@@ -497,8 +530,8 @@ def save_data():
             "director_transactions_last_updated",
             "director_interests_last_updated",
             "historical_as_traded_last_updated",
-            "announcements_api_fetched_last_updated",
-            "announcements_scraped_last_updated"
+            "announcements_api_last_updated",
+            "announcements_dom_last_updated"
         ]
         timestamp_status = {col: update_timestamps.get(col, False) for col in timestamp_columns}
 

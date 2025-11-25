@@ -10,7 +10,7 @@ let loggingPrefs = {};
 const categoryMapping = {
     'Diagnostic': ['ErrorHandlingLogs', 'ErrorLogs', 'WarningLogs', 'GeneralLogs', 'DebugLogs', 'NotificationLogs'],
     'Operation': ['ScrapeLogs', 'ServerLogs', 'TickerCompletionLogs', 'DataLogs', 'AnnouncementLogs'],
-    'System': ['TabLogs', 'PortLogs', 'ConfigLogs', 'RetryLogs', 'ActionLogs', 'PerfLogs', 'DownloadLogs'],
+    'System': ['TabLogs', 'TabLogs', 'PortLogs', 'ConfigLogs', 'RetryLogs', 'ActionLogs', 'PerfLogs', 'DownloadLogs'],
     'Prefix': ['prefixDateTime', 'prefixTickerSymbol', 'prefixTabId', 'prefixPortId', 'prefixPortName']
 };
 
@@ -238,7 +238,7 @@ document.addEventListener('DOMContentLoaded', () => {
                             ticker: state.ticker,
                             status: state.status,
                             isPaused: state.isPaused,
-                            rowStartTime: Date.now()
+                            rowStartTime: state.rowStartTime
                         });
                         updateTabEntry(state.tabId);
                     });
@@ -304,20 +304,19 @@ document.addEventListener('DOMContentLoaded', () => {
         tabTrackingDiv.innerHTML = '';
         log(['TabLogs'], [`updateTabStates states: `, states]);
         for (const [id, state] of Object.entries(states)) {
-            const tabId = parseInt(state.tabId);
-            const existingState = tabStates.get(tabId);
-            tabStates.set(tabId, {
+            tabStates.set(parseInt(state.tabId), {
                 ticker: state.ticker,
                 status: state.status,
                 isPaused: state.isPaused,
-                rowStartTime: existingState ? existingState.rowStartTime : Date.now()
+                rowStartTime: state.rowStartTime
             });
             const entry = document.createElement('div');
             entry.className = 'tab-entry';
             entry.id = `tab-${state.tabId}`;
             entry.dataset.tabId = state.tabId;
+            const elapsedSeconds = state.rowStartTime ? Math.floor((Date.now() - state.rowStartTime) / 1000) : 0;
             entry.innerHTML = `
-                <span class="timer">${0}s</span>
+                <span class="timer">${formatTime(elapsedSeconds)}</span>
                 <span>Ticker: ${state.ticker || '-'}</span>
                 <span>Status: ${state.status || 'Initializing'}</span>
                 <button class="pause-tab" data-tabid="${state.tabId}" data-ticker="${state.ticker || ''}" ${state.isPaused ? 'disabled' : ''}>${state.isPaused ? '❚❚' : '❚❚'}</button>

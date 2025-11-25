@@ -62,17 +62,14 @@ function log(categories, message, context = {}) {
         if (loggingPrefs['prefixPortName'] && context.portName) pre_message += `[${context.portName}]`;
         pre_message += pre_message ? ' ' : '';
 
-        // Determine log method (default: console.log)
         const logMethod = categories.includes('ErrorLogs') ? console.error :
                          categories.includes('WarningLogs') ? console.warn :
                          console.log;
 
-        // Handle objects & arrays
         if (typeof message === 'object' && message !== null) {
             let firstElement = '';
             let remainingElements;
 
-            // Arrays: Extract & trim first string element
             if (Array.isArray(message)) {
                 if (message.length > 0 && typeof message[0] === 'string') {
                     firstElement = message[0].trim();
@@ -80,9 +77,7 @@ function log(categories, message, context = {}) {
                 } else {
                     remainingElements = message;
                 }
-            }
-            // Objects: Extract & trim first string property
-            else {
+            } else {
                 const keys = Object.keys(message);
                 if (keys.length > 0 && typeof message[keys[0]] === 'string') {
                     firstElement = message[keys[0]].trim();
@@ -93,18 +88,14 @@ function log(categories, message, context = {}) {
                 }
             }
 
-            // Combine pre_message + first trimmed element (if any)
             const combinedMessage = pre_message + firstElement;
             
-            // Log with remaining elements as separate args
             if (firstElement) {
                 logMethod(combinedMessage, ...(Array.isArray(remainingElements) ? remainingElements : [remainingElements]));
             } else {
                 logMethod(pre_message, ...(Array.isArray(remainingElements) ? remainingElements : [remainingElements]));
             }
-        }
-        // Handle primitives (strings, numbers, etc.)
-        else {
+        } else {
             logMethod(`${pre_message}${message}`);
         }
     }
@@ -112,15 +103,15 @@ function log(categories, message, context = {}) {
 
 function getClientLocalDateTime() {
     const now = new Date();
-    return now.toLocaleString(); // returns in local format based on client's browser settings
+    return now.toLocaleString();
 }
 
 async function checkTabClosedByUser(tabId) {
     try {
         await chrome.tabs.get(tabId);
-        return false; // Tab exists, not closed
+        return false;
     } catch (error) {
-        return true; // Tab not found, likely closed by user
+        return true;
     }
 }
 
@@ -177,7 +168,8 @@ chrome.runtime.onConnect.addListener((port) => {
                 tabId: id,
                 ticker: state.ticker || '',
                 status: state.status || 'Initializing',
-                isPaused: state.isPaused || false
+                isPaused: state.isPaused || false,
+                rowStartTime: state.rowStartTime
             }));
             port.postMessage({ action: 'update_tab_states', data: tabStatesArray });
             while (popupMessageQueue.length > 0) {
@@ -214,14 +206,56 @@ function disableDisconnectListener(tabId, tickerSymbol = null) {
     }
 }
 
-async function handleMessage(message, port, key) {
-    log(['DebugLogs', 'PortLogs'], [`handleMessage: `, message, port, key]);
+/**
+ * Checks all open tabs for a window.tabId variable and returns values not present in tabStates.
+ * @param {Map<number, Object>} tabStates - Map of tab IDs to their state objects.
+ * @returns {Promise<Array<{tabId: number, windowTabId: any}>>} Array of objects containing the tab ID and window.tabId value for tabs where window.tabId is defined and not a key in tabStates.
+ */
+async function checkWindowTabIds(tabStates) {
+    log(['DebugLogs', 'TabLogs'], [`checkWindowTabIds(tabStates):`, tabStates]);
 
+    try {
+        const tabs = await chrome.tabs.query({});
+        const results = [];
+
+        for (const tab of tabs) {
+            if (!tab.url || tab.url.startsWith('chrome://') || tab.url.startsWith('about://')) {
+                log(['DebugLogs', 'TabLogs'], `Skipping tab ${tab.id}: URL (${tab.url}) does not support scripting`);
+                continue;
+            }
+
+            try {
+                const [result] = await chrome.scripting.executeScript({
+                    target: { tabId: tab.id },
+                    func: () => {
+                        return typeof window.tabId !== 'undefined' ? window.tabId : null;
+                    }
+                });
+
+                if (result && result.result !== null && !tabStates.has(result.result)) {
+                    results.push({
+                        tabId: tab.id,
+                        windowTabId: result.result
+                    });
+                }
+            } catch (error) {
+                log(['DebugLogs'], `Error checking window.tabId in tab ${tab.id}: ${error.message}`);
+            }
+        }
+
+        log(['DebugLogs', 'TabLogs'], [`checkWindowTabIds() Return:`, results]);
+        return results;
+    } catch (error) {
+        log(['DebugLogs', 'TabLogs'], `Failed to query tabs: ${error.message}`);
+        return [];
+    }
+}
+
+async function handleMessage(message, port, key) {
     const tabId = key !== 'popup' ? key : null;
     const tickerSymbol = message.tickerSymbol || '';
     const action = message.action || '';
     
-    // Mapping for timestamp_updates keys to display names
     const timestampFieldNames = {
         'basic_fundamentals_last_updated': 'Fundamentals',
         'director_transactions_last_updated': 'Director Transactions',
@@ -278,7 +312,8 @@ async function handleMessage(message, port, key) {
                         tabId: id,
                         ticker: state.ticker || '',
                         status: state.status || 'Initializing',
-                        isPaused: state.isPaused || false
+                        isPaused: state.isPaused || false,
+                        rowStartTime: state.rowStartTime
                     }))
                 };
                 sendToPopup(tabStatesResponse);
@@ -329,7 +364,7 @@ async function handleMessage(message, port, key) {
                                     log(['ErrorLogs', 'TabLogs'], `Failed to reload tab ${message.tabId}: ${chrome.runtime.lastError.message}`, { tabId: message.tabId, tickerSymbol: ticker });
                                     reject(chrome.runtime.lastError.message);
                                 } else {
-                                    log(['TabLogs'], `Tab ${message.tabId} reloaded`, { tabId: message.tabId, tickerSymbol: ticker });
+                                    log(['TabLogs'], `Tab ${tabId} reloaded`, { tabId: message.tabId, tickerSymbol: ticker });
                                     resolve();
                                 }
                             });
@@ -349,7 +384,7 @@ async function handleMessage(message, port, key) {
                             sendToPopup({ action: 'tab_closed', tabId: message.tabId });
                             const tab = await chrome.tabs.create({ url: `${baseURL}${message.tickerSymbol.toLowerCase()}`, active: false });
                             activeTabs.add(tab.id);
-                            tabStates.set(tab.id, { ticker: message.tickerSymbol.toUpperCase(), status: 'Initializing', isPaused: false, isAdHoc: false });
+                            tabStates.set(tab.id, { ticker: message.tickerSymbol.toUpperCase(), status: 'Initializing', isPaused: false, isAdHoc: false, rowStartTime: Date.now() });
                             log(['TabLogs'], `Created new tab ${tab.id}`, { tabId: tab.id, tickerSymbol: message.tickerSymbol });
                             await injectionSetup(tab.id, message.tickerSymbol);
                             await sendToTab(tab.id, { action: 'check_page', tickerSymbol: message.tickerSymbol });
@@ -506,7 +541,7 @@ async function handleMessage(message, port, key) {
                     });
             
                     if (payload.historical_download_id) {
-                        await deleteFile(payload.historical_download_id, tabId, tickerSymbol);
+                        // await deleteFile(payload.historical_download_id, tabId, tickerSymbol);
                     }
             
                     if (!response.ok) {
@@ -583,6 +618,21 @@ async function handleMessage(message, port, key) {
                     port.postMessage({ id: message.id, success: false, error: error.message });
                 }
                 break;
+            case 'increment_404_count':
+                try {
+                    const response = await fetch('http://127.0.0.1:5000/increment_404_count', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ tickerSymbol: message.tickerSymbol })
+                    });
+                    if (!response.ok) throw new HttpError(`HTTP error! Status: ${response.status}`, response.status, response.statusText);
+                    const data = await response.json();
+                    port.postMessage({ id: message.id, success: true, data });
+                } catch (error) {
+                    log(['ErrorLogs', 'ServerLogs'], `Error incrementing 404 count for ${message.tickerSymbol}: ${error.message}`, { tabId, tickerSymbol });
+                    port.postMessage({ id: message.id, success: false, error: error.message });
+                }
+                break;
             case 'next_ticker':
                 if (tabStates.get(tabId)?.isAdHoc) {
                     log(['TabLogs'], `Ad hoc tab ${tabId} completed scraping, not assigning next ticker`, { tabId, tickerSymbol });
@@ -619,15 +669,25 @@ async function handleMessage(message, port, key) {
                     port.postMessage({ id: message.id, success: false, error: 'No ticker provided' });
                     return;
                 }
-                const tab = await chrome.tabs.create({ url: `${baseURL}${ticker.toLowerCase()}`, active: false });
+                let tab;
+                const untrackedTabs = await checkWindowTabIds(tabStates);
+                const reusableTab = untrackedTabs.find(t => t.windowTabId === t.tabId);
+                if (reusableTab) {
+                    tab = { id: reusableTab.tabId };
+                    await chrome.tabs.update(tab.id, { url: `${baseURL}${ticker.toLowerCase()}`, active: false });
+                    log(['TabLogs'], `Reusing tab ${tab.id} for single ticker scrape: ${ticker}`, { tabId: tab.id, tickerSymbol: ticker });
+                } else {
+                    tab = await chrome.tabs.create({ url: `${baseURL}${ticker.toLowerCase()}`, active: false });
+                    log(['TabLogs'], `Created new tab ${tab.id} for single ticker scrape: ${ticker}`, { tabId: tab.id, tickerSymbol: ticker });
+                }
                 activeTabs.add(tab.id);
                 tabStates.set(tab.id, { 
-                    ticker: ticker,  // Fixed: using the local 'ticker' variable
+                    ticker: ticker,
                     status: 'Initializing', 
                     isPaused: false,
-                    isAdHoc: true 
+                    isAdHoc: true,
+                    rowStartTime: Date.now()
                 });
-                log(['TabLogs'], `Created tab ${tab.id} for single ticker scrape: ${ticker}`, { tabId: tab.id, tickerSymbol: ticker });
                 broadcastTabStates();
                 await injectionSetup(tab.id, ticker);
                 port.postMessage({ id: message.id, success: true });
@@ -692,7 +752,8 @@ function broadcastTabStates() {
         tabId: id,
         ticker: state.ticker || '',
         status: state.status || 'Initializing',
-        isPaused: state.isPaused || false
+        isPaused: state.isPaused || false,
+        rowStartTime: state.rowStartTime
     }));
     sendToPopup({ action: 'update_tab_states', data: tabStatesArray });
 }
@@ -723,10 +784,19 @@ async function adjustTabs() {
     if (currentActive < targetTabs && tickerQueue.length > 0) {
         const tabsToCreate = Math.min(targetTabs - currentActive, tickerQueue.length);
         for (let i = 0; i < tabsToCreate; i++) {
-            const tab = await chrome.tabs.create({ url: "", active: false });
+            let tab;
+            const untrackedTabs = await checkWindowTabIds(tabStates);
+            const reusableTab = untrackedTabs.find(t => t.windowTabId === t.tabId);
+            if (reusableTab) {
+                tab = { id: reusableTab.tabId };
+                await chrome.tabs.update(tab.id, { url: "", active: false });
+                log(['TabLogs'], `Reusing tab ${tab.id} for scraping`, { tabId: tab.id });
+            } else {
+                tab = await chrome.tabs.create({ url: "", active: false });
+                log(['TabLogs'], `Created new tab ${tab.id}`, { tabId: tab.id });
+            }
             activeTabs.add(tab.id);
-            tabStates.set(tab.id, { ticker: '', status: 'Initializing', isPaused: false, isAdHoc: false });
-            log(['TabLogs'], `Created tab ${tab.id}`, { tabId: tab.id });
+            tabStates.set(tab.id, { ticker: '', status: 'Initializing', isPaused: false, isAdHoc: false, rowStartTime: Date.now() });
             broadcastTabStates();
             await processTab(tab.id);
             await new Promise(resolve => setTimeout(resolve, 500));
@@ -735,7 +805,6 @@ async function adjustTabs() {
 }
 
 function updateTabStatus(tabId, { ticker, status, isPaused } = {}) {
-
     if (!ticker) {
         console.trace('no ticker in updateTabStatus()');
         if (tabId) {
@@ -748,11 +817,13 @@ function updateTabStatus(tabId, { ticker, status, isPaused } = {}) {
     }
 
     if (tabId) {
+        const existingState = tabStates.get(tabId);
         tabStates.set(tabId, {
-            ...tabStates.get(tabId) || { ticker: '', status: 'Initializing', isPaused: false, isAdHoc: false },
+            ...existingState || { ticker: '', status: 'Initializing', isPaused: false, isAdHoc: false, rowStartTime: Date.now() },
             ...(ticker != null ? { ticker } : {}),
             ...(status != null ? { status } : {}),
-            ...(isPaused != null ? { isPaused } : {})
+            ...(isPaused != null ? { isPaused } : {}),
+            rowStartTime: existingState ? existingState.rowStartTime : Date.now()
         });
         broadcastTabStates();
     }
@@ -760,12 +831,12 @@ function updateTabStatus(tabId, { ticker, status, isPaused } = {}) {
 
 function getTickerByTabId(tabId) {
     const tabState = tabStates.get(tabId);
-    return tabState?.ticker || null; // Returns ticker or null if not found
+    return tabState?.ticker || null;
 }
 
 function isPausedByTabId(tabId) {
     const tabState = tabStates.get(tabId);
-    return tabState?.isPaused || null; // Returns true if paused
+    return tabState?.isPaused || null;
 }
 
 async function processTickerQueue() {
@@ -784,11 +855,6 @@ async function processTab(tabId) {
         return;
     }
 
-    // if (isPausedByTabId(tabId)) {
-    //     updateTabStatus(tabId, { status: 'Complete, Paused' });
-    //     return;
-    // }
-
     const tickerSymbol = tickerQueue.shift();
     if (!tickerSymbol) return;
 
@@ -799,7 +865,6 @@ async function processTab(tabId) {
 
 async function injectionSetup(tabId, tickerSymbol) {
     try {
-        // 1. Validate tab existence first
         const portData = ports.get(tabId);
         if (portData?.port && portData?.disconnectHandler) {
             disableDisconnectListener(tabId, tickerSymbol);
@@ -814,14 +879,12 @@ async function injectionSetup(tabId, tickerSymbol) {
 
         const url = `${baseURL}${tickerSymbol.toLowerCase()}`;
         
-        // 2. Update tab URL
         try {
             await chrome.tabs.update(tabId, { url });
         } catch (error) {
             throw new Error(`Failed to update tab URL: ${error.message}`);
         }
 
-        // 3. Wait for load with timeout
         await new Promise((resolve, reject) => {
             const listener = (updatedTabId, info) => {
                 if (updatedTabId === tabId && info.status === 'complete') {
@@ -838,7 +901,6 @@ async function injectionSetup(tabId, tickerSymbol) {
             }, 45000);
         });
 
-        // 4. Proceed with injection
         const isAdHoc = tabStates.get(tabId)?.isAdHoc || false;
         
         try {
@@ -873,13 +935,11 @@ async function injectionSetup(tabId, tickerSymbol) {
             }
         });
         
-        // Only retry for timeout errors or temporary failures
         if (error.message.includes('timeout') || error.message.includes('temporary')) {
             const retryDelay = 5000;
             log(['RetryLogs', 'TabLogs'], `Retrying setup for tab ${tabId} in ${retryDelay}ms`, { tabId, tickerSymbol });
             setTimeout(() => injectionSetup(tabId, tickerSymbol), retryDelay);
         } else {
-            // For permanent errors, clean up the tab
             activeTabs.delete(tabId);
             tabStates.delete(tabId);
             sendToPopup({ action: 'tab_closed', tabId });
@@ -894,7 +954,6 @@ async function injectionSetup(tabId, tickerSymbol) {
     }
 }
 
-// Helper function
 async function tabExists(tabId) {
     try {
         await chrome.tabs.get(tabId);
@@ -906,14 +965,6 @@ async function tabExists(tabId) {
 
 function fixDownloadURL(str) {
     return str;
-    const lastSlashIndex = str.lastIndexOf('/');
-    if (lastSlashIndex === -1) {
-        return str.slice(0, 3); // No slash, take first 3 chars of string
-    }
-    const prefix = str.slice(0, lastSlashIndex + 1); // Everything up to and including last /
-    const lastSegment = str.slice(lastSlashIndex + 1); // Part after last /
-    const shortenedSegment = lastSegment.slice(0, 3); // First 3 chars of last segment
-    return prefix + shortenedSegment;
 }
 
 async function prepareScrapedDataPayload(message) {

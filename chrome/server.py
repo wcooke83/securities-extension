@@ -3,16 +3,19 @@ import os
 import re
 import psycopg2
 import logging
+import pandas as pd
 from datetime import datetime
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from dotenv import load_dotenv
 from sqlalchemy import create_engine
 from psycopg2.extras import execute_values
+from psycopg2.extras import execute_values
+from psycopg2 import Error as PsycopgError
 
 logging.basicConfig(
     filename=f"{os.path.splitext(os.path.basename(__file__))[0]}.log",
-    level=logging.WARNING,
+    level=logging.DEBUG,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
@@ -51,14 +54,14 @@ def get_tickers():
 
         query = '''SELECT DISTINCT LEFT(i.ticker_symbol, POSITION('.' IN i.ticker_symbol) - 1) AS symbol, i.last_scrape_attempt , history_last_updated
                     FROM market_instruments i
-                    WHERE i.is_active = TRUE 
-					AND history_last_updated IS null
+                    WHERE history_last_updated IS null
                     AND i.instrument_type = 'stock' 
                     AND i.ticker_symbol LIKE '%.AX'
 					AND LENGTH(i.ticker_symbol) = 6
-                    ORDER BY i.last_scrape_attempt ASC, symbol ASC;'''
+                    AND ticker_symbol_404_count < 1
+                    ORDER BY i.last_scrape_attempt NULLS FIRST, symbol ASC;'''
 
-        query = '''WITH ranked_instruments AS (
+        query1 = '''WITH ranked_instruments AS (
                         SELECT 
                             LEFT(i.ticker_symbol, POSITION('.' IN i.ticker_symbol) - 1) AS symbol, 
                             i.ticker_symbol AS full_ticker_symbol,
@@ -89,6 +92,18 @@ def get_tickers():
                     WHERE rn = 1
                     ORDER BY last_scrape_attempt NULLS FIRST;'''
 
+
+        query2 = '''SELECT LEFT(mi.ticker_symbol, POSITION('.' IN mi.ticker_symbol) - 1) AS symbol
+                    FROM market_instruments mi
+                    LEFT JOIN market_history_as_traded mht
+                        ON mi.ticker_symbol = mht.ticker_symbol
+                    WHERE mi.instrument_type = 'stock'
+                        AND LENGTH(mi.ticker_symbol) = 6
+                        AND mht.ticker_symbol IS NULL
+                        AND ticker_symbol_404_count < 1
+                    ORDER BY last_scrape_attempt NULLS FIRST;'''
+
+
         cursor.execute(query)
         tickers = [row[0] for row in cursor.fetchall()]
         logger.info(f"Fetched {len(tickers)} tickers.")
@@ -109,6 +124,45 @@ def get_tickers():
                 logger.info("Connection closed in get_tickers.")
             except Exception as e:
                 logger.error(f"Error closing connection in get_tickers: {e}")
+
+@app.route('/increment_404_count', methods=['POST'])
+def increment_404_count():
+    conn = None
+    try:
+        data = request.json
+        ticker_symbol = normalize_ticker(data.get('tickerSymbol'))
+        if not ticker_symbol:
+            return jsonify({'error': 'Invalid ticker symbol'}), 400
+
+        conn = engine.raw_connection()
+        cursor = conn.cursor()
+
+        query = """
+            UPDATE market_instruments
+            SET ticker_symbol_404_count = COALESCE(ticker_symbol_404_count, 0) + 1
+            WHERE ticker_symbol = %s
+        """
+        cursor.execute(query, (ticker_symbol,))
+        if cursor.rowcount == 0:
+            logger.warning(f"No record found for ticker_symbol: {ticker_symbol}")
+            return jsonify({'error': 'Ticker symbol not found'}), 404
+
+        conn.commit()
+        cursor.close()
+        conn.close()
+        return jsonify({'status': 'success'})
+
+    except Exception as e:
+        logger.error(f"Error incrementing 404 count: {e}")
+        if conn is not None:
+            conn.rollback()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception as e:
+                logger.error(f"Error closing connection: {e}")
 
 @app.route("/api/files/<tickerSymbol>", methods=["GET"])
 def get_existing_files(tickerSymbol):
@@ -405,93 +459,244 @@ def save_data():
         # Save historical data from historical_filepath
         if historical_filepath:
             if not os.path.exists(historical_filepath):
-                # return jsonify({"error": f"File not found at {historical_filepath}"}), 400
                 logger.error(f"Error: File not found at {historical_filepath}")
-            
-            
-            logger.debug(f"Reading historical data from {historical_filepath}")
-            with open(historical_filepath, 'r') as f:
-                csv_content = f.read().splitlines()
-            
-            headers = [h.strip() for h in csv_content[0].split(",")]
-            historical_records_saved = 0
-            total_records = len(csv_content) - 1
-            batch_data = []
+                return jsonify({"error": f"File not found at {historical_filepath}"}), 400
 
-            # Determine column indices based on header
+            # Read CSV with pandas
             try:
-                date_col = headers.index('Date')
-                symbol_col = headers.index('Symbol') if 'Symbol' in headers else None
-                open_col = headers.index('Open')
-                high_col = headers.index('High')
-                low_col = headers.index('Low')
-                close_col = headers.index('Close')
-                volume_col = headers.index('Volume')
-            except ValueError as e:
-                # return jsonify({"error": f"CSV file is missing required column: {str(e)}"}), 400
-                logger.error(f"Missing required column in header: {str(e)}")
+                df = pd.read_csv(historical_filepath, dtype={'Date': str, 'Open': float, 'High': float, 'Low': float, 'Close': float, 'Volume': int})
+            except Exception as e:
+                logger.error(f"Failed to read CSV at {historical_filepath}: {str(e)}")
+                return jsonify({"error": f"Failed to read CSV: {str(e)}"}), 400
 
-            for line in csv_content[1:]:
-                if not line.strip():
-                    total_records -= 1
-                    continue
-                
-                values = [v.strip() for v in line.split(",")]
-                if len(values) != len(headers):
-                    total_records -= 1
-                    continue
-                
+            if df.empty:
+                logger.error(f"Empty file at {historical_filepath}")
+                return jsonify({"error": f"Empty file at {historical_filepath}"}), 400
+
+            expected_data_rows = len(df)
+            logger.info(f"File {historical_filepath} has {expected_data_rows} data rows")
+
+            # Remove duplicates and empty rows
+            df = df.dropna().loc[df[['Date', 'Open', 'High', 'Low', 'Close', 'Volume']].ne('').all(axis=1)]
+            duplicates = df.duplicated(subset=['Date']).sum()  # Since Symbol is not in CSV, use Date for deduplication
+            df = df.drop_duplicates(subset=['Date'])
+            logger.info(f"After deduplication: {len(df)} unique records, {duplicates} duplicates removed")
+
+            # Validate and format data
+            batch_data = []
+            skipped_rows = []
+            for idx, row in df.iterrows():
                 try:
-                    # Use the column indices we determined from the header
-                    date = clean_date(values[date_col])
-                    if not date:
-                        logger.warning(f"Invalid date '{values[date_col]}' in historical record, skipping...")
+                    # Parse date: Convert YYYYMMDD to YYYY-MM-DD
+                    date = clean_date(row['Date'])
+                    if pd.isna(date):
+                        skipped_rows.append((dict(row), f"Invalid date: {row['Date']}"))
                         continue
-                    
-                    # If symbol exists in CSV, use it (otherwise use formatted_ticker_symbol from elsewhere)
-                    symbol = values[symbol_col] if symbol_col is not None else formatted_ticker_symbol
-                    
-                    open_price = float(values[open_col])
-                    high = float(values[high_col])
-                    low = float(values[low_col])
-                    close = float(values[close_col])
-                    volume = int(values[volume_col])
+                    date = date.strftime('%Y-%m-%d')
+                    symbol = formatted_ticker_symbol  # ABR.AX
+                    # Validate numeric fields
+                    open_price = float(row['Open'])
+                    high = float(row['High'])
+                    low = float(row['Low'])
+                    close = float(row['Close'])
+                    volume = int(row['Volume'])
+                    for col, val in [('Open', open_price), ('High', high), ('Low', low), ('Close', close)]:
+                        if pd.isna(val) or val < 0 or val > 999999.9999:
+                            skipped_rows.append((dict(row), f"Invalid {col}: {val}"))
+                            continue
+                    if pd.isna(volume) or volume < 0 or volume > 2**63-1:
+                        skipped_rows.append((dict(row), f"Invalid Volume: {volume}"))
+                        continue
+                    batch_data.append((symbol, date, open_price, high, low, close, None, volume))
+                except (ValueError, TypeError) as e:
+                    skipped_rows.append((dict(row), f"Validation error: {str(e)}"))
+                    continue
 
-                    batch_data.append((
-                        symbol,
-                        date,
-                        open_price,
-                        high,
-                        low,
-                        close,
-                        None,  # adj_close (not in source data)
-                        volume
-                    ))
-                    historical_records_saved += 1
+            # Rest of the code remains unchanged...
 
-                except Exception as e:
-                    logger.error(f"Error processing historical record {line}: {str(e)}")
-                    conn.rollback()
-                    return jsonify({"error": f"Failed to process historical record: {str(e)}"}), 500
+            valid_records = len(batch_data)
+            logger.info(f"Validated {valid_records} records, skipped {len(skipped_rows)} rows")
+            if skipped_rows:
+                logger.warning(f"Skipped rows (first 10): {[(row[0], row[1]) for row in skipped_rows][:10]}{'...' if len(skipped_rows) > 10 else ''}")
+
+            if not batch_data:
+                logger.error(f"No valid records for {formatted_ticker_symbol}")
+                return jsonify({"error": f"No valid records for {formatted_ticker_symbol}"}), 400
+
+            # Execute insert/update
+            query = """
+                INSERT INTO market_history_as_traded (ticker_symbol, date, open, high, low, close, adj_close, volume)
+                VALUES %s
+                ON CONFLICT (ticker_symbol, date) DO UPDATE SET
+                    open = EXCLUDED.open,
+                    high = EXCLUDED.high,
+                    low = EXCLUDED.low,
+                    close = EXCLUDED.close,
+                    adj_close = EXCLUDED.adj_close,
+                    volume = EXCLUDED.volume
+                RETURNING ticker_symbol, date, open, high, low, close, volume
+            """
+            try:
+                result = execute_values(cursor, query, batch_data, fetch=True)
+                returned_rows = len(result)
+                affected_rows = cursor.rowcount
+                logger.info(f"cursor.rowcount: {affected_rows}, RETURNING rows: {returned_rows}")
                 
-            if batch_data:
-                query = """
-                    INSERT INTO market_history_as_traded (ticker_symbol, date, open, high, low, close, adj_close, volume)
-                    VALUES %s
-                    ON CONFLICT (ticker_symbol, date) DO UPDATE SET
-                        open = EXCLUDED.open,
-                        high = EXCLUDED.high,
-                        low = EXCLUDED.low,
-                        close = EXCLUDED.close,
-                        adj_close = EXCLUDED.adj_close,
-                        volume = EXCLUDED.volume
-                """
-                execute_values(cursor, query, batch_data)
-                logger.info(f"Successfully saved {historical_records_saved}/{total_records} historical records for {formatted_ticker_symbol}")
-                update_timestamps["historical_as_traded_last_updated"] = True
-            elif total_records > 0:
+                # Use returned_rows for success check
+                inserted = {(row[0], str(row[1])): (float(row[2]), float(row[3]), float(row[4]), float(row[5]), row[6]) for row in result}
+                expected = {(row[0], str(row[1])): (row[2], row[3], row[4], row[5], row[7]) for row in batch_data}
+                missing = expected.keys() - inserted.keys()
+                logger.info(f"Processed {returned_rows}/{valid_records} rows for {formatted_ticker_symbol}")
+
+                # Log inserted and missing rows
+                if inserted:
+                    logger.debug(f"Inserted/updated rows (first 10): {[(k, v) for k, v in list(inserted.items())[:10]]}{'...' if len(inserted) > 10 else ''}")
+                if missing:
+                    missing_details = []
+                    no_op_query = """
+                        SELECT ticker_symbol, date
+                        FROM market_history_as_traded
+                        WHERE (ticker_symbol, date) = (%s, %s)
+                        AND open = %s AND high = %s AND low = %s AND close = %s AND volume = %s
+                        AND (adj_close IS NULL) = (%s IS NULL)
+                    """
+                    for row in batch_data:
+                        key = (row[0], str(row[1]))
+                        if key in missing:
+                            cursor.execute(no_op_query, (row[0], row[1], row[2], row[3], row[4], row[5], row[7], row[6]))
+                            reason = "No-op update (data matches existing)" if cursor.fetchone() else "Unknown reason (possible constraint)"
+                            missing_details.append((key, expected[key], reason))
+                    logger.warning(f"Missing from RETURNING {len(missing)} rows (first 10): {missing_details[:10]}{'...' if len(missing_details) > 10 else ''}")
+
+                # Check success using returned_rows
+                if returned_rows == valid_records:
+                    logger.info(f"Successfully saved {returned_rows}/{valid_records} rows for {formatted_ticker_symbol}")
+                    update_timestamps["historical_as_traded_last_updated"] = True
+                else:
+                    logger.error(f"Incomplete save for {formatted_ticker_symbol}: {returned_rows}/{valid_records} rows")
+                    conn.rollback()
+                    return jsonify({
+                        "error": f"Incomplete save for {formatted_ticker_symbol}",
+                        "details": f"Processed {returned_rows}/{valid_records} rows, missing: {len(missing)}"
+                    }), 400
+            except PsycopgError as e:
+                logger.error(f"Database error: {e.pgcode} - {e.pgerror}")
                 conn.rollback()
-                return jsonify({"error": f"Failed to save historical data for {formatted_ticker_symbol}: no valid records processed"}), 500
+                return jsonify({"error": f"Database error: {str(e)}"}), 500
+            
+        # if historical_filepath:
+        #     if not os.path.exists(historical_filepath):
+        #         logger.error(f"Error: File not found at {historical_filepath}")
+        #         return jsonify({"error": f"File not found at {historical_filepath}"}), 400
+            
+        #     logger.debug(f"Reading historical data from {historical_filepath}")
+        #     with open(historical_filepath, 'r', encoding='utf-8') as f:
+        #         csv_content = f.read().splitlines()
+            
+        #     if not csv_content:
+        #         logger.error(f"Empty file at {historical_filepath}")
+        #         return jsonify({"error": f"Empty file at {historical_filepath}"}), 400
+
+        #     # Count total lines and adjust for header
+        #     total_lines = len(csv_content)
+        #     has_header = total_lines > 0  # Assume header if file is not empty
+        #     expected_data_rows = total_lines - 1 if has_header else total_lines
+        #     logger.info(f"File {historical_filepath} has {total_lines} lines, expecting {expected_data_rows} data rows")
+
+        #     headers = [h.strip() for h in csv_content[0].split(",")] if has_header else []
+        #     batch_data = []
+        #     valid_records = 0
+
+        #     # Determine column indices based on header
+        #     if has_header:
+        #         try:
+        #             date_col = headers.index('Date')
+        #             symbol_col = headers.index('Symbol') if 'Symbol' in headers else None
+        #             open_col = headers.index('Open')
+        #             high_col = headers.index('High')
+        #             low_col = headers.index('Low')
+        #             close_col = headers.index('Close')
+        #             volume_col = headers.index('Volume')
+        #         except ValueError as e:
+        #             logger.error(f"Missing required column in header: {str(e)}")
+        #             return jsonify({"error": f"CSV file is missing required column: {str(e)}"}), 400
+
+        #     # Process data rows (skip header if present)
+        #     start_index = 1 if has_header else 0
+        #     for line in csv_content[start_index:]:
+        #         if not line.strip():
+        #             expected_data_rows -= 1
+        #             continue
+                
+        #         values = [v.strip() for v in line.split(",")]
+        #         if has_header and len(values) != len(headers):
+        #             expected_data_rows -= 1
+        #             continue
+                
+        #         try:
+        #             date = clean_date(values[date_col])
+        #             if not date:
+        #                 logger.warning(f"Invalid date '{values[date_col]}' in historical record, skipping...")
+        #                 expected_data_rows -= 1
+        #                 continue
+                    
+        #             symbol = values[symbol_col] if symbol_col is not None else formatted_ticker_symbol
+                    
+        #             open_price = float(values[open_col])
+        #             high = float(values[high_col])
+        #             low = float(values[low_col])
+        #             close = float(values[close_col])
+        #             volume = int(values[volume_col])
+
+        #             batch_data.append((
+        #                 symbol,
+        #                 date,
+        #                 open_price,
+        #                 high,
+        #                 low,
+        #                 close,
+        #                 None,  # adj_close (not in source data)
+        #                 volume
+        #             ))
+        #             valid_records += 1
+
+        #         except (ValueError, IndexError) as e:
+        #             logger.warning(f"Skipping invalid historical record '{line}': {str(e)}")
+        #             expected_data_rows -= 1
+        #             continue
+            
+        #     if not batch_data:
+        #         logger.error(f"No valid records processed for {formatted_ticker_symbol}")
+        #         return jsonify({"error": f"Failed to save historical data for {formatted_ticker_symbol}: no valid records processed"}), 400
+
+        #     # Execute insert/update and count affected rows
+        #     query = """
+        #         INSERT INTO market_history_as_traded (ticker_symbol, date, open, high, low, close, adj_close, volume)
+        #         VALUES %s
+        #         ON CONFLICT (ticker_symbol, date) DO UPDATE SET
+        #             open = EXCLUDED.open,
+        #             high = EXCLUDED.high,
+        #             low = EXCLUDED.low,
+        #             close = EXCLUDED.close,
+        #             adj_close = EXCLUDED.adj_close,
+        #             volume = EXCLUDED.volume
+        #         RETURNING ticker_symbol
+        #     """
+        #     execute_values(cursor, query, batch_data, fetch=True)
+        #     affected_rows = cursor.rowcount
+        #     logger.info(f"Processed {valid_records} valid records, inserted/updated {affected_rows}/{expected_data_rows} rows for {formatted_ticker_symbol}")
+
+        #     # Check if the number of affected rows matches the expected data rows
+        #     if affected_rows == expected_data_rows:
+        #         logger.info(f"Successfully saved {affected_rows}/{expected_data_rows} historical records for {formatted_ticker_symbol}")
+        #         update_timestamps["historical_as_traded_last_updated"] = True
+        #     else:
+        #         logger.error(f"Failed to save historical data for {formatted_ticker_symbol}: inserted/updated {affected_rows} rows, expected {expected_data_rows}")
+        #         conn.rollback()
+        #         return jsonify({
+        #             "error": f"Failed to save historical data for {formatted_ticker_symbol}",
+        #             "details": f"Inserted/updated {affected_rows} rows, expected {expected_data_rows}"
+        #         }), 400
 
         # Save company overview and details to market_instruments
         if company_overview or company_details:

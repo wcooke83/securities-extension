@@ -287,6 +287,9 @@ function checkPage(tickerSymbol, callback) {
 
 // Define getConfigAsync with retries
 async function getConfigAsync(maxRetries = 3, retryDelay = 5000) {
+    
+    log(['TabLogs', 'ConfigLogs'], `getConfigAsync(${maxRetries}, ${retryDelay})`, { tabId, tickerSymbol });
+
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
             const response = await new Promise((resolve, reject) => {
@@ -301,16 +304,18 @@ async function getConfigAsync(maxRetries = 3, retryDelay = 5000) {
 
             if (response && response.config) {
                 popupConfig = response.config;
+
+                log(['TabLogs', 'ConfigLogs'], [`return popupConfig: `, popupConfig], { tabId, tickerSymbol });
                 return popupConfig;
             } else {
                 throw new Error('Invalid response: config not found');
             }
         } catch (error) {
-            log(['WarningLogs'], `Attempt ${attempt} failed: ${error.message}`, { tabId, tickerSymbol });
+            log(['WarningLogs', 'ConfigLogs'], `Attempt ${attempt} failed: ${error.message}`, { tabId, tickerSymbol });
             if (attempt < maxRetries) {
                 await new Promise(resolve => setTimeout(resolve, retryDelay));
             } else {
-                log(['ErrorLogs'], `Failed to get config after ${maxRetries} attempts`, { tabId, tickerSymbol });
+                log(['ErrorLogs', 'ConfigLogs'], `Failed to get config after ${maxRetries} attempts`, { tabId, tickerSymbol });
                 return {};
             }
         }
@@ -397,16 +402,25 @@ try {
                         break;
                     case 'check_page':
                         checkPage(msg.tickerSymbol, (success) => {
-
                             if (success === 'ticker') {
-                                    
                                 sendMessage({ action: 'page_result', tabId, success: true });
                                 startScraping();
-                            } else if (success === '404' && !window.isAdHoc) {
-
-                                sendMessage({ action: 'next_ticker' });
+                            } else if (success === '404') {
+                                sendMessage(
+                                    { action: 'increment_404_count', tickerSymbol: msg.tickerSymbol },
+                                    (res) => {
+                                        if (!res?.success) {
+                                            log(['ErrorLogs'], `Failed to increment 404 count for ${msg.tickerSymbol}`, { tabId, tickerSymbol: msg.tickerSymbol });
+                                        }
+                                    }
+                                );
+                                if (!window.isAdHoc) {
+                                    updateTabStatus("404, one moment");
+                                    setTimeout(() => {
+                                        sendMessage({ action: 'next_ticker' });
+                                    }, 10000);
+                                }
                             } else if (!success) {
-
                                 sendMessage({ action: 'next_ticker' });
                             }
                         });

@@ -15,6 +15,10 @@ let currentState = 'resumed';
 let messageId = 0;
 let port;
 const callbacks = new Map();
+let reconnectAttempts = 0;
+const MAX_RECONNECT_ATTEMPTS = 5;
+const RECONNECT_DELAY = 2000;
+let isReconnecting = false;
 
 const tabId = window.tabId;
 const tickerSymbol = window.location.pathname.split('/').pop().split('.').shift().toUpperCase();
@@ -197,7 +201,25 @@ async function sendMessage(message, callback) {
     if (callback) callbacks.set(id, callback);
     const fullMessage = { ...message, id, tickerSymbol };
     log(['DebugLogs'], [`${tickerSymbol} - Content script sending message (tab ${tabId}, ID: ${id}):`, fullMessage]);
-    port.postMessage(fullMessage);
+
+    try {
+        if (!port) {
+            throw new Error('Port not connected');
+        }
+        port.postMessage(fullMessage);
+    } catch (error) {
+        log(['ErrorLogs', 'PortLogs'], `Failed to send message: ${error.message}`, { tabId, tickerSymbol });
+
+        // Remove callback if message failed
+        if (callback) callbacks.delete(id);
+
+        // Attempt to reconnect
+        if (!isReconnecting) {
+            attemptReconnect();
+        }
+
+        throw error;
+    }
 }
 
 async function updateTabStatus(status) {
@@ -370,18 +392,27 @@ try {
     let totalAPIFetchedAnnouncements = 0;
     let popupConfig = {};
 
-    const announcementsContainer = document.querySelector('[id$="-all-announcements"]');
+    function toValidSelector(id) {
+        return `#${id.replace(/^(\d)/, '\\3$1 ')}`;
+    }
+
+    const tickerLower = tickerSymbol.toLowerCase();
+    const announcementsContainer = document.querySelector(`${toValidSelector(tickerLower)}-all-announcements`) ||
+                                    document.querySelector('[id$="-all-announcements"]');
     const tableContainer = announcementsContainer?.querySelector('#app-table');
 
-    // Define onDOMReady as an async function
-    async function onDOMReady() {
-        log(['GeneralLogs', 'TabLogs'], 'Content script loaded for tab', { tabId, tickerSymbol });
+    if (!announcementsContainer) {
+        log(['WarningLogs'], `Could not find announcements container for ${tickerSymbol}`, { tabId, tickerSymbol });
+    }
+    if (!tableContainer) {
+        log(['WarningLogs'], `Could not find table container for ${tickerSymbol}`, { tabId, tickerSymbol });
+    }
 
-        // Connect to the background script
-        port = chrome.runtime.connect({ name: `content-${tabId}` });
-        log(['PortLogs', 'TabLogs'], 'Port connected for tab', { tabId, tickerSymbol });
+    // ============================================================================
+    // PORT CONNECTION & RECONNECTION
+    // ============================================================================
 
-        // Set up the message listener before fetching config
+    function setupPortListeners(port) {
         port.onMessage.addListener(async (msg) => {
             log(['DebugLogs', 'PortLogs'], `Content script received message (tab ${tabId}): ${JSON.stringify(msg)}`, { tabId, tickerSymbol });
             if (msg.id !== undefined && callbacks.has(msg.id)) {
@@ -433,6 +464,72 @@ try {
             }
             return true;
         });
+
+        port.onDisconnect.addListener(() => {
+            log(['WarningLogs', 'PortLogs'], `Port disconnected for tab ${tabId}`, { tabId, tickerSymbol });
+
+            if (isReconnecting) return; // Already reconnecting
+
+            // Attempt reconnection
+            attemptReconnect();
+        });
+    }
+
+    async function attemptReconnect() {
+        if (isReconnecting) return;
+
+        isReconnecting = true;
+        reconnectAttempts++;
+
+        if (reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
+            log(['ErrorLogs', 'PortLogs'], `Max reconnection attempts (${MAX_RECONNECT_ATTEMPTS}) reached for tab ${tabId}`, { tabId, tickerSymbol });
+            isReconnecting = false;
+            return;
+        }
+
+        log(['RetryLogs', 'PortLogs'], `Attempting to reconnect port (attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`, { tabId, tickerSymbol });
+
+        await new Promise(resolve => setTimeout(resolve, RECONNECT_DELAY));
+
+        try {
+            port = chrome.runtime.connect({ name: `content-${tabId}` });
+            setupPortListeners(port);
+
+            // Reset reconnect counter on success
+            reconnectAttempts = 0;
+            isReconnecting = false;
+
+            log(['GeneralLogs', 'PortLogs'], `Port reconnected successfully for tab ${tabId}`, { tabId, tickerSymbol });
+
+            // Re-send content_ready message
+            sendMessage({ action: 'content_ready', tabId });
+        } catch (error) {
+            log(['ErrorLogs', 'PortLogs'], `Port reconnection failed: ${error.message}`, { tabId, tickerSymbol });
+            isReconnecting = false;
+
+            // Try again
+            setTimeout(() => attemptReconnect(), RECONNECT_DELAY);
+        }
+    }
+
+    function connectToBackground() {
+        try {
+            port = chrome.runtime.connect({ name: `content-${tabId}` });
+            setupPortListeners(port);
+            log(['PortLogs', 'TabLogs'], 'Port connected for tab', { tabId, tickerSymbol });
+            reconnectAttempts = 0; // Reset on successful connection
+        } catch (error) {
+            log(['ErrorLogs', 'PortLogs'], `Failed to connect port: ${error.message}`, { tabId, tickerSymbol });
+            attemptReconnect();
+        }
+    }
+
+    // Define onDOMReady as an async function
+    async function onDOMReady() {
+        log(['GeneralLogs', 'TabLogs'], 'Content script loaded for tab', { tabId, tickerSymbol });
+
+        // Connect to the background script
+        connectToBackground();
 
         // Fetch configuration and wait for it
         popupConfig = await getConfigAsync();
@@ -688,6 +785,10 @@ try {
         async function scrapeAnnouncementsFromCurrentPage() {
             try {
                 updateTabStatus("Scrape Announcements");
+                if (!tableContainer) {
+                    log(['ErrorLogs', 'ScrapeLogs'], `Cannot scrape announcements: tableContainer is null`, { tabId, tickerSymbol });
+                    return [];
+                }
                 let table = tableContainer.querySelector('table');
                 if (!table) {
                     log(['ScrapeLogs'], `No table found on page ${pageCounter.value}, observing tableContainer`, { tabId, tickerSymbol });
@@ -757,6 +858,7 @@ try {
                     }
 
                     announcements.push({
+                        tickerSymbol,
                         filename,
                         date: rawDate,
                         heading: rawHeading,
@@ -931,8 +1033,8 @@ try {
         }
 
         async function scrapeAnnouncementsViaDom() {
-            if (!tableContainer) {
-                log(['WarningLogs', 'ScrapeLogs'], 'No announcements table found', { tabId, tickerSymbol });
+            if (!tableContainer || !announcementsContainer) {
+                log(['ErrorLogs', 'ScrapeLogs'], `Cannot scrape via DOM: tableContainer=${!!tableContainer}, announcementsContainer=${!!announcementsContainer}`, { tabId, tickerSymbol });
                 return;
             }
 

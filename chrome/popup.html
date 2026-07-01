@@ -88,6 +88,47 @@
         .single-ticker-container input {
             margin-right: 10px;
         }
+        #transferStats {
+            margin-top: 15px;
+            padding: 10px;
+            border: 1px solid #ccc;
+            background-color: #f9f9f9;
+        }
+        #transferStats h3 {
+            margin-top: 0;
+            margin-bottom: 10px;
+            font-size: 16px;
+        }
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 8px;
+            margin-bottom: 10px;
+        }
+        .stats-grid .stat-item:first-child {
+            grid-column: 1 / -1;
+        }
+        .stat-item {
+            display: flex;
+            justify-content: space-between;
+            padding: 5px;
+            background-color: #fff;
+            border: 1px solid #ddd;
+            border-radius: 3px;
+        }
+        .stat-label {
+            font-weight: bold;
+            font-size: 12px;
+        }
+        .stat-value {
+            color: #0066cc;
+            font-weight: bold;
+            font-size: 14px;
+        }
+        #resetStatsButton {
+            width: 100%;
+            margin-top: 5px;
+        }
     </style>
 </head>
 <body>
@@ -124,6 +165,44 @@
         <button id="scrapeSingleButton">Scrape Single Ticker</button>
     </div>
     <div id="status">Idle</div>
+    <div id="transferStats">
+        <h3>Transfer Statistics</h3>
+        <div class="stats-grid">
+            <div class="stat-item">
+                <span class="stat-label">Total Transfers:</span>
+                <span class="stat-value" id="totalTransfers">0</span>
+            </div>
+            <div class="stat-item">
+                <span class="stat-label">PDF Files:</span>
+                <span class="stat-value" id="pdfTransfers">0</span>
+            </div>
+            <div class="stat-item">
+                <span class="stat-label">CSV Files:</span>
+                <span class="stat-value" id="csvTransfers">0</span>
+            </div>
+            <div class="stat-item">
+                <span class="stat-label">JSON Files:</span>
+                <span class="stat-value" id="jsonTransfers">0</span>
+            </div>
+            <div class="stat-item">
+                <span class="stat-label">Other Files:</span>
+                <span class="stat-value" id="otherTransfers">0</span>
+            </div>
+            <div class="stat-item">
+                <span class="stat-label">Total Data:</span>
+                <span class="stat-value" id="totalData">0 B</span>
+            </div>
+            <div class="stat-item">
+                <span class="stat-label">Avg Speed:</span>
+                <span class="stat-value" id="avgSpeed">0 B/s</span>
+            </div>
+            <div class="stat-item">
+                <span class="stat-label">Last Speed:</span>
+                <span class="stat-value" id="lastSpeed">0 B/s</span>
+            </div>
+        </div>
+        <button id="resetStatsButton">Reset Statistics</button>
+    </div>
     <div id="tabTracking">
         <!-- Tab entries will be dynamically added here -->
     </div>

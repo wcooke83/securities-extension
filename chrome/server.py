@@ -21,8 +21,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "chrome-extension://nkhbkjimmfojklinimpgcgllkeiijmko"}})
-logger.info("CORS initialized with origin: chrome-extension://nkhbkjimmfojklinimpgcgllkeiijmko")
+CORS(app, resources={r"/*": {"origins": "chrome-extension://inadcfbcpkkbkhdldchgcejamkdgalcp"}})
+logger.info("CORS initialized with origin: chrome-extension://inadcfbcpkkbkhdldchgcejamkdgalcp")
 
 # Database Configuration
 def db_connect():
@@ -374,7 +374,7 @@ def save_api_announcements():
 def save_data():
     if request.method == "OPTIONS":
         response = jsonify({"status": "ok"})
-        response.headers['Access-Control-Allow-Origin'] = 'chrome-extension://nkhbkjimmfojklinimpgcgllkeiijmko'
+        response.headers['Access-Control-Allow-Origin'] = 'chrome-extension://inadcfbcpkkbkhdldchgcejamkdgalcp'
         response.headers['Access-Control-Allow-Methods'] = 'POST, OPTIONS'
         response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
         logger.debug("Handled OPTIONS preflight request")
@@ -834,4 +834,4 @@ def clean_time(time_str):
         return None
 
 if __name__ == "__main__":
-    app.run(debug=True, port=5000)
+    app.run(debug=True, port=5020)

@@ -2,6 +2,8 @@
 // This script manages the communication between the popup, content scripts, and the server.
 // It handles the scraping process, manages tabs, and communicates with the server for data storage.
 
+importScripts('config.js');
+
 let isRunning = false;
 let isPaused = false;
 let tickerQueue = [];
@@ -16,6 +18,19 @@ let savedAPIAnnouncementsCount = {};
 let savedScrapedAnnouncementsCount = {};
 const retryInjectionSetupTime = 30000;
 const ports = new Map();
+let heartbeatInterval = null;
+let activeDownloads = new Map(); // Track active downloads for recovery
+let transferStats = {
+    total: 0,
+    pdf: 0,
+    csv: 0,
+    json: 0,
+    other: 0,
+    totalBytes: 0,
+    totalTimeMs: 0,
+    lastSpeedBytesPerSec: 0,
+    currentDownloadSpeed: 0
+};
 const baseURL = `https://www.marketindex.com.au/asx/`;
 const allCategories = [
     'ErrorLogs', 'WarningLogs', 'GeneralLogs', 'DebugLogs', 'ScrapeLogs', 'ServerLogs',
@@ -45,7 +60,89 @@ function loadLoggingPrefs() {
     });
 }
 
+async function loadTransferStats() {
+    try {
+        const { transferStats: saved } = await chrome.storage.local.get('transferStats');
+        if (saved) {
+            transferStats = saved;
+            log(['DebugLogs'], `Loaded transfer stats: ${JSON.stringify(transferStats)}`, {});
+        }
+    } catch (error) {
+        log(['ErrorLogs'], `Failed to load transfer stats: ${error.message}`, {});
+    }
+}
+
+async function saveTransferStats() {
+    try {
+        await chrome.storage.local.set({ transferStats });
+        log(['DebugLogs'], `Saved transfer stats: ${JSON.stringify(transferStats)}`, {});
+    } catch (error) {
+        log(['ErrorLogs'], `Failed to save transfer stats: ${error.message}`, {});
+    }
+}
+
+function getFileTypeFromFilename(filename) {
+    if (!filename) return 'other';
+    const ext = filename.split('.').pop().toLowerCase();
+    if (ext === 'pdf') return 'pdf';
+    if (ext === 'csv') return 'csv';
+    if (ext === 'json') return 'json';
+    return 'other';
+}
+
+async function incrementTransferCount(fileType, fileSize, downloadTimeMs) {
+    transferStats.total++;
+    transferStats[fileType] = (transferStats[fileType] || 0) + 1;
+
+    // Update speed statistics
+    if (fileSize && downloadTimeMs > 0) {
+        transferStats.totalBytes += fileSize;
+        transferStats.totalTimeMs += downloadTimeMs;
+        transferStats.lastSpeedBytesPerSec = (fileSize / downloadTimeMs) * 1000;
+    }
+
+    await saveTransferStats();
+    broadcastTransferStats();
+    log(['DebugLogs'], `Transfer count incremented: ${fileType}, size: ${fileSize} bytes, time: ${downloadTimeMs}ms, speed: ${transferStats.lastSpeedBytesPerSec.toFixed(2)} bytes/sec`, {});
+}
+
+function formatSpeed(bytesPerSec) {
+    if (bytesPerSec === 0) return '0 B/s';
+    const units = ['B/s', 'KB/s', 'MB/s', 'GB/s'];
+    let value = bytesPerSec;
+    let unitIndex = 0;
+
+    while (value >= 1024 && unitIndex < units.length - 1) {
+        value /= 1024;
+        unitIndex++;
+    }
+
+    return `${value.toFixed(2)} ${units[unitIndex]}`;
+}
+
+function broadcastTransferStats() {
+    sendToPopup({ action: 'transfer_stats_update', stats: transferStats });
+}
+
+async function resetTransferStats() {
+    transferStats = {
+        total: 0,
+        pdf: 0,
+        csv: 0,
+        json: 0,
+        other: 0,
+        totalBytes: 0,
+        totalTimeMs: 0,
+        lastSpeedBytesPerSec: 0,
+        currentDownloadSpeed: 0
+    };
+    await saveTransferStats();
+    broadcastTransferStats();
+    log(['GeneralLogs'], 'Transfer stats reset', {});
+}
+
 loadLoggingPrefs();
+loadTransferStats();
 
 chrome.storage.onChanged.addListener((changes, area) => {
     if (area === 'local' && 'loggingPreferences' in changes) {
@@ -105,6 +202,234 @@ function getClientLocalDateTime() {
     const now = new Date();
     return now.toLocaleString();
 }
+
+// ============================================================================
+// STATE PERSISTENCE & RECOVERY
+// ============================================================================
+
+async function persistState() {
+    try {
+        const state = {
+            tickerQueue,
+            activeTabs: Array.from(activeTabs),
+            tabStates: Array.from(tabStates.entries()),
+            isRunning,
+            isPaused,
+            currentMaxTabs,
+            downloadPdfs,
+            closeTabs,
+            apiFetchAnnouncements,
+            webScrapeAnnouncements,
+            savedAPIAnnouncementsCount,
+            savedScrapedAnnouncementsCount,
+            activeDownloads: Array.from(activeDownloads.entries()),
+            lastPersisted: Date.now()
+        };
+        await chrome.storage.local.set({ extensionState: state });
+        log(['DebugLogs'], `State persisted: ${tickerQueue.length} tickers, ${activeTabs.size} tabs`, {});
+    } catch (error) {
+        log(['ErrorLogs'], `Failed to persist state: ${error.message}`, {});
+    }
+}
+
+async function restoreState() {
+    try {
+        const { extensionState } = await chrome.storage.local.get('extensionState');
+        if (!extensionState) {
+            log(['GeneralLogs'], 'No saved state found', {});
+            return;
+        }
+
+        const age = Date.now() - (extensionState.lastPersisted || 0);
+        log(['GeneralLogs'], `Restoring state from ${Math.round(age / 1000)}s ago`, {});
+
+        tickerQueue = extensionState.tickerQueue || [];
+        activeTabs = new Set(extensionState.activeTabs || []);
+        tabStates = new Map(extensionState.tabStates || []);
+        isRunning = extensionState.isRunning || false;
+        isPaused = extensionState.isPaused || false;
+        currentMaxTabs = extensionState.currentMaxTabs || 3;
+        downloadPdfs = extensionState.downloadPdfs ?? true;
+        closeTabs = extensionState.closeTabs ?? true;
+        apiFetchAnnouncements = extensionState.apiFetchAnnouncements ?? true;
+        webScrapeAnnouncements = extensionState.webScrapeAnnouncements ?? true;
+        savedAPIAnnouncementsCount = extensionState.savedAPIAnnouncementsCount || {};
+        savedScrapedAnnouncementsCount = extensionState.savedScrapedAnnouncementsCount || {};
+        activeDownloads = new Map(extensionState.activeDownloads || []);
+
+        log(['GeneralLogs'], `State restored: ${tickerQueue.length} tickers, ${activeTabs.size} tabs`, {});
+
+        // Validate restored tabs still exist
+        const validTabs = new Set();
+        for (const tabId of activeTabs) {
+            try {
+                await chrome.tabs.get(tabId);
+                validTabs.add(tabId);
+            } catch {
+                log(['WarningLogs'], `Tab ${tabId} no longer exists, removing from state`, { tabId });
+                tabStates.delete(tabId);
+            }
+        }
+        activeTabs = validTabs;
+
+        // Resume scraping if it was running
+        if (isRunning && !isPaused && tickerQueue.length > 0) {
+            log(['GeneralLogs'], 'Resuming scraping from restored state', {});
+            await adjustTabs();
+        }
+
+        // Recover downloads
+        await recoverDownloads();
+
+        return true;
+    } catch (error) {
+        log(['ErrorLogs'], `Failed to restore state: ${error.message}`, {});
+        return false;
+    }
+}
+
+// Auto-save state on changes
+function scheduleStatePersistence() {
+    if (scheduleStatePersistence.timeoutId) {
+        clearTimeout(scheduleStatePersistence.timeoutId);
+    }
+    scheduleStatePersistence.timeoutId = setTimeout(() => {
+        persistState();
+    }, 2000); // Debounce for 2 seconds
+}
+
+// ============================================================================
+// KEEP-ALIVE MECHANISM
+// ============================================================================
+
+function startHeartbeat() {
+    if (heartbeatInterval) return;
+
+    log(['DebugLogs'], 'Starting service worker heartbeat', {});
+    heartbeatInterval = setInterval(() => {
+        // Keep service worker alive with a simple API call
+        chrome.runtime.getPlatformInfo(() => {
+            if (chrome.runtime.lastError) {
+                log(['WarningLogs'], `Heartbeat error: ${chrome.runtime.lastError.message}`, {});
+            }
+        });
+    }, 20000); // Every 20 seconds (well under 30s limit)
+}
+
+function stopHeartbeat() {
+    if (heartbeatInterval) {
+        log(['DebugLogs'], 'Stopping service worker heartbeat', {});
+        clearInterval(heartbeatInterval);
+        heartbeatInterval = null;
+    }
+}
+
+// ============================================================================
+// DOWNLOAD STATE RECOVERY
+// ============================================================================
+
+async function trackDownload(downloadId, tickerSymbol, url) {
+    activeDownloads.set(downloadId, { tickerSymbol, url, startTime: Date.now() });
+    await chrome.storage.local.set({
+        [`download_${downloadId}`]: { tickerSymbol, url, timestamp: Date.now() }
+    });
+    scheduleStatePersistence();
+}
+
+async function untrackDownload(downloadId) {
+    activeDownloads.delete(downloadId);
+    await chrome.storage.local.remove(`download_${downloadId}`);
+    scheduleStatePersistence();
+}
+
+async function recoverDownloads() {
+    try {
+        const storage = await chrome.storage.local.get();
+        const downloadKeys = Object.keys(storage).filter(key => key.startsWith('download_'));
+
+        if (downloadKeys.length === 0) return;
+
+        log(['GeneralLogs'], `Recovering ${downloadKeys.length} downloads`, {});
+
+        for (const key of downloadKeys) {
+            const downloadId = parseInt(key.split('_')[1]);
+            const downloadInfo = storage[key];
+
+            try {
+                const results = await chrome.downloads.search({ id: downloadId });
+                if (results.length > 0) {
+                    const download = results[0];
+                    if (download.state === 'complete') {
+                        log(['DownloadLogs'], `Recovered completed download ${downloadId}`, {
+                            tickerSymbol: downloadInfo.tickerSymbol
+                        });
+                        await untrackDownload(downloadId);
+                    } else if (download.state === 'interrupted') {
+                        log(['WarningLogs'], `Download ${downloadId} was interrupted`, {
+                            tickerSymbol: downloadInfo.tickerSymbol
+                        });
+                        await untrackDownload(downloadId);
+                    } else {
+                        // Download still in progress
+                        activeDownloads.set(downloadId, downloadInfo);
+                    }
+                } else {
+                    // Download not found, clean up
+                    await untrackDownload(downloadId);
+                }
+            } catch (error) {
+                log(['ErrorLogs'], `Error recovering download ${downloadId}: ${error.message}`, {});
+                await untrackDownload(downloadId);
+            }
+        }
+    } catch (error) {
+        log(['ErrorLogs'], `Failed to recover downloads: ${error.message}`, {});
+    }
+}
+
+// ============================================================================
+// ALARM HANDLERS FOR LONG DELAYS
+// ============================================================================
+
+chrome.alarms.onAlarm.addListener((alarm) => {
+    log(['DebugLogs'], `Alarm triggered: ${alarm.name}`, {});
+
+    if (alarm.name.startsWith('retry_injection_')) {
+        const [, , tabId, tickerSymbol] = alarm.name.split('_');
+        injectionSetup(parseInt(tabId), tickerSymbol);
+    } else if (alarm.name === 'persist_state') {
+        persistState();
+    }
+});
+
+// Create periodic state persistence alarm
+chrome.alarms.create('persist_state', { periodInMinutes: 1 });
+
+// ============================================================================
+// SERVICE WORKER LIFECYCLE
+// ============================================================================
+
+chrome.runtime.onStartup.addListener(async () => {
+    log(['GeneralLogs'], 'Extension startup - restoring state', {});
+    await restoreState();
+});
+
+chrome.runtime.onInstalled.addListener(async (details) => {
+    log(['GeneralLogs'], `Extension installed: ${details.reason}`, {});
+    if (details.reason === 'install') {
+        // First install
+        await persistState();
+    } else if (details.reason === 'update') {
+        // Extension updated, try to restore state
+        await restoreState();
+    }
+});
+
+// Restore state when service worker wakes up
+(async () => {
+    log(['GeneralLogs'], 'Service worker initialized', {});
+    await restoreState();
+})();
 
 async function checkTabClosedByUser(tabId) {
     try {
@@ -172,6 +497,7 @@ chrome.runtime.onConnect.addListener((port) => {
                 rowStartTime: state.rowStartTime
             }));
             port.postMessage({ action: 'update_tab_states', data: tabStatesArray });
+            port.postMessage({ action: 'transfer_stats_update', stats: transferStats });
             while (popupMessageQueue.length > 0) {
                 const queuedMessage = popupMessageQueue.shift();
                 log(['PortLogs'], `Sending queued message to popup: ${JSON.stringify(queuedMessage)}`, {});
@@ -411,6 +737,7 @@ async function handleMessage(message, port, key) {
                         log(['TabLogs'], `Closed tab ${message.tabId}`, { tabId: message.tabId, tickerSymbol: ticker });
                         sendToPopup({ action: 'tab_closed', tabId: message.tabId });
                         broadcastTabStates();
+                        scheduleStatePersistence();
                         if (message.id !== undefined) port.postMessage({ id: message.id, success: true });
                     } catch (error) {
                         log(['ErrorLogs', 'TabLogs'], `Failed to close tab ${message.tabId}: ${error.message}`, { tabId: message.tabId, tickerSymbol });
@@ -431,8 +758,10 @@ async function handleMessage(message, port, key) {
                     isRunning = true;
                     activeTabs.clear();
                     tabStates.clear();
+                    startHeartbeat(); // Start keep-alive
                     await fetchTickersAndStartScraping();
                     sendToPopup({ action: 'status_update', isRunning: true, isPaused: false });
+                    scheduleStatePersistence();
                     if (message.id !== undefined) port.postMessage({ id: message.id, success: true });
                 }
                 break;
@@ -445,6 +774,7 @@ async function handleMessage(message, port, key) {
                     }
                     broadcastTabStates();
                     sendToPopup({ action: 'status_update', isRunning: true, isPaused: true });
+                    scheduleStatePersistence();
                     if (message.id !== undefined) port.postMessage({ id: message.id, success: true });
                 }
                 break;
@@ -458,6 +788,7 @@ async function handleMessage(message, port, key) {
                     broadcastTabStates();
                     processTickerQueue();
                     sendToPopup({ action: 'status_update', isRunning: true, isPaused: false });
+                    scheduleStatePersistence();
                     if (message.id !== undefined) port.postMessage({ id: message.id, success: true });
                 }
                 break;
@@ -489,7 +820,7 @@ async function handleMessage(message, port, key) {
                 break;
             case 'get_existing_files':
                 try {
-                    const response = await fetch(`http://127.0.0.1:5000/api/files/${message.tickerSymbol}`);
+                    const response = await fetch(`${CONFIG.BACKEND_URL}/api/files/${message.tickerSymbol}`);
                     if (!response.ok) throw new HttpError(`HTTP error! Status: ${response.status}`, response.status, response.statusText);
                     const data = await response.json();
                     port.postMessage({ id: message.id, success: true, files: data.files });
@@ -500,7 +831,7 @@ async function handleMessage(message, port, key) {
                 break;
             case 'save_scraped_announcement_batch':
                 try {
-                    const response = await fetch("http://127.0.0.1:5000/api/announcements_via_dom", {
+                    const response = await fetch(`${CONFIG.BACKEND_URL}/api/announcements_via_dom`, {
                         method: "POST",
                         headers: { "Content-Type": "application/json" },
                         body: JSON.stringify({ announcements: message.batch })
@@ -516,7 +847,7 @@ async function handleMessage(message, port, key) {
                 break;
             case 'save_api_announcement_batch':
                 try {
-                    const response = await fetch("http://127.0.0.1:5000/api/announcements_via_api", {
+                    const response = await fetch(`${CONFIG.BACKEND_URL}/api/announcements_via_api`, {
                         method: "POST",
                         headers: { "Content-Type": "application/json" },
                         body: JSON.stringify({ announcements: message.batch })
@@ -534,7 +865,7 @@ async function handleMessage(message, port, key) {
                 try {
                     const payload = await prepareScrapedDataPayload(message);
                     log(['DataLogs', 'AnnouncementLogs'], `Announcements Saved: API Fetched: ${payload.update_timestamps.announcements_api_last_updated}, Scraped: ${payload.update_timestamps.announcements_dom_last_updated}`, { tabId, tickerSymbol });
-                    const response = await fetch("http://127.0.0.1:5000/save_data", {
+                    const response = await fetch(`${CONFIG.BACKEND_URL}/save_data`, {
                         method: "POST",
                         headers: { "Content-Type": "application/json" },
                         body: JSON.stringify(payload)
@@ -602,6 +933,15 @@ async function handleMessage(message, port, key) {
                         chrome.tabs.remove(tabId);
                         sendToPopup({ action: 'tab_closed', tabId });
                     }
+
+                    // Stop heartbeat if no more active tabs
+                    if (activeTabs.size === 0 && tickerQueue.length === 0) {
+                        stopHeartbeat();
+                        isRunning = false;
+                        sendToPopup({ action: 'status_update', isRunning: false, isPaused: false });
+                    }
+
+                    scheduleStatePersistence();
                 } catch (error) {
                     const logCategories = (error.responseBody && typeof error.responseBody === 'string' && error.responseBody.includes('Permission denied'))
                         ? ['ServerLogs']
@@ -620,7 +960,7 @@ async function handleMessage(message, port, key) {
                 break;
             case 'increment_404_count':
                 try {
-                    const response = await fetch('http://127.0.0.1:5000/increment_404_count', {
+                    const response = await fetch(`${CONFIG.BACKEND_URL}/increment_404_count`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ tickerSymbol: message.tickerSymbol })
@@ -641,6 +981,7 @@ async function handleMessage(message, port, key) {
                         tabStates.delete(tabId);
                         chrome.tabs.remove(tabId);
                         sendToPopup({ action: 'tab_closed', tabId });
+                        scheduleStatePersistence();
                     }
                     port.postMessage({ id: message.id, success: true });
                 } else {
@@ -654,6 +995,10 @@ async function handleMessage(message, port, key) {
             case 'get_config':
                 const config = { currentMaxTabs, downloadPdfs, closeTabs, apiFetchAnnouncements, webScrapeAnnouncements };
                 port.postMessage({ id: message.id, success: true, config });
+                break;
+            case 'reset_transfer_stats':
+                await resetTransferStats();
+                port.postMessage({ id: message.id, success: true });
                 break;
             case 'enable_disconnect_listener':
                 enableDisconnectListener(key);
@@ -760,7 +1105,7 @@ function broadcastTabStates() {
 
 async function fetchTickersAndStartScraping() {
     try {
-        const response = await fetch("http://127.0.0.1:5000/get_tickers");
+        const response = await fetch(`${CONFIG.BACKEND_URL}/get_tickers`);
         if (!response.ok) throw new HttpError(`HTTP error! Status: ${response.status}`, response.status, response.statusText);
         tickerQueue = await response.json();
         log(['ServerLogs'], `Fetched ${tickerQueue.length} tickers`, {});
@@ -826,6 +1171,7 @@ function updateTabStatus(tabId, { ticker, status, isPaused } = {}) {
             rowStartTime: existingState ? existingState.rowStartTime : Date.now()
         });
         broadcastTabStates();
+        scheduleStatePersistence();
     }
 }
 
@@ -851,6 +1197,7 @@ async function processTab(tabId) {
             tabStates.delete(tabId);
             chrome.tabs.remove(tabId);
             sendToPopup({ action: 'tab_closed', tabId });
+            scheduleStatePersistence();
         }
         return;
     }
@@ -860,6 +1207,7 @@ async function processTab(tabId) {
 
     updateTabStatus(tabId, { ticker: tickerSymbol.toUpperCase(), status: 'Processing', isPaused: false });
     log(['TabLogs', 'ActionLogs'], `Processing ticker ${tickerSymbol} on tab ${tabId}`, { tabId, tickerSymbol });
+    scheduleStatePersistence();
     injectionSetup(tabId, tickerSymbol);
 }
 
@@ -936,9 +1284,10 @@ async function injectionSetup(tabId, tickerSymbol) {
         });
         
         if (error.message.includes('timeout') || error.message.includes('temporary')) {
-            const retryDelay = 5000;
-            log(['RetryLogs', 'TabLogs'], `Retrying setup for tab ${tabId} in ${retryDelay}ms`, { tabId, tickerSymbol });
-            setTimeout(() => injectionSetup(tabId, tickerSymbol), retryDelay);
+            const retryDelayMinutes = 0.1; // 6 seconds (minimum chrome.alarms allows)
+            log(['RetryLogs', 'TabLogs'], `Retrying setup for tab ${tabId} in ${retryDelayMinutes * 60}s`, { tabId, tickerSymbol });
+            const alarmName = `retry_injection_${tabId}_${tickerSymbol}`;
+            chrome.alarms.create(alarmName, { delayInMinutes: retryDelayMinutes });
         } else {
             activeTabs.delete(tabId);
             tabStates.delete(tabId);
@@ -1018,20 +1367,42 @@ async function downloadAndSendToServer(historicalDownloadUrl, tabId, tickerSymbo
             url: historicalDownloadUrl,
             filename,
             saveAs: false
-        }, (downloadId) => {
+        }, async (downloadId) => {
             if (chrome.runtime.lastError) {
                 log(['ErrorLogs', 'DownloadLogs'], `Download failed: ${chrome.runtime.lastError.message}`, { tabId, tickerSymbol });
                 resolve({ filePath: null, downloadId: null });
                 return;
             }
+
+            // Track download for recovery
+            await trackDownload(downloadId, tickerSymbol, historicalDownloadUrl);
+
             chrome.downloads.onChanged.addListener(function onChanged(delta) {
                 if (delta.id === downloadId && delta.state && delta.state.current === 'complete') {
                     chrome.downloads.onChanged.removeListener(onChanged);
-                    chrome.downloads.search({ id: downloadId }, (results) => {
-                        const filePath = results?.[0]?.filename || null;
-                        log(['DownloadLogs'], `File Downloaded, filePath: ${filePath}, downloadId: ${downloadId}`, { tabId, tickerSymbol });
+                    chrome.downloads.search({ id: downloadId }, async (results) => {
+                        const downloadItem = results?.[0];
+                        const filePath = downloadItem?.filename || null;
+                        const fileSize = downloadItem?.fileSize || 0;
+
+                        // Calculate download time
+                        const downloadInfo = activeDownloads.get(downloadId);
+                        const downloadTimeMs = downloadInfo?.startTime ? Date.now() - downloadInfo.startTime : 0;
+
+                        log(['DownloadLogs'], `File Downloaded, filePath: ${filePath}, size: ${fileSize} bytes, time: ${downloadTimeMs}ms, downloadId: ${downloadId}`, { tabId, tickerSymbol });
+
+                        // Increment transfer counter by file type with speed info
+                        const fileType = getFileTypeFromFilename(filePath);
+                        await incrementTransferCount(fileType, fileSize, downloadTimeMs);
+
+                        await untrackDownload(downloadId);
                         resolve({ filePath, downloadId });
                     });
+                } else if (delta.id === downloadId && delta.state && delta.state.current === 'interrupted') {
+                    chrome.downloads.onChanged.removeListener(onChanged);
+                    log(['ErrorLogs', 'DownloadLogs'], `Download interrupted: ${downloadId}`, { tabId, tickerSymbol });
+                    untrackDownload(downloadId);
+                    resolve({ filePath: null, downloadId: null });
                 }
             });
         });

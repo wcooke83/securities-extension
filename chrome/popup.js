@@ -166,6 +166,15 @@ document.addEventListener('DOMContentLoaded', () => {
     const scrapeSingleButton = document.getElementById('scrapeSingleButton');
     const statusDiv = document.getElementById('status');
     const tabTrackingDiv = document.getElementById('tabTracking');
+    const resetStatsButton = document.getElementById('resetStatsButton');
+    const totalTransfersSpan = document.getElementById('totalTransfers');
+    const pdfTransfersSpan = document.getElementById('pdfTransfers');
+    const csvTransfersSpan = document.getElementById('csvTransfers');
+    const jsonTransfersSpan = document.getElementById('jsonTransfers');
+    const otherTransfersSpan = document.getElementById('otherTransfers');
+    const totalDataSpan = document.getElementById('totalData');
+    const avgSpeedSpan = document.getElementById('avgSpeed');
+    const lastSpeedSpan = document.getElementById('lastSpeed');
 
     let currentStatus = 'Idle';
     const tabStates = new Map();
@@ -191,6 +200,54 @@ document.addEventListener('DOMContentLoaded', () => {
         port.postMessage({ ...message, id });
     }
 
+    function formatBytes(bytes) {
+        if (bytes === 0) return '0 B';
+        const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+        let value = bytes;
+        let unitIndex = 0;
+
+        while (value >= 1024 && unitIndex < units.length - 1) {
+            value /= 1024;
+            unitIndex++;
+        }
+
+        return `${value.toFixed(2)} ${units[unitIndex]}`;
+    }
+
+    function formatSpeed(bytesPerSec) {
+        if (bytesPerSec === 0) return '0 B/s';
+        const units = ['B/s', 'KB/s', 'MB/s', 'GB/s'];
+        let value = bytesPerSec;
+        let unitIndex = 0;
+
+        while (value >= 1024 && unitIndex < units.length - 1) {
+            value /= 1024;
+            unitIndex++;
+        }
+
+        return `${value.toFixed(2)} ${units[unitIndex]}`;
+    }
+
+    function updateTransferStats(stats) {
+        totalTransfersSpan.textContent = stats.total || 0;
+        pdfTransfersSpan.textContent = stats.pdf || 0;
+        csvTransfersSpan.textContent = stats.csv || 0;
+        jsonTransfersSpan.textContent = stats.json || 0;
+        otherTransfersSpan.textContent = stats.other || 0;
+
+        // Update data and speed information
+        totalDataSpan.textContent = formatBytes(stats.totalBytes || 0);
+        lastSpeedSpan.textContent = formatSpeed(stats.lastSpeedBytesPerSec || 0);
+
+        // Calculate average speed
+        const avgSpeed = (stats.totalTimeMs > 0)
+            ? (stats.totalBytes / stats.totalTimeMs) * 1000
+            : 0;
+        avgSpeedSpan.textContent = formatSpeed(avgSpeed);
+
+        log(['DebugLogs'], `Updated transfer stats: ${JSON.stringify(stats)}`);
+    }
+
     port.onMessage.addListener((msg) => {
         log(['DebugLogs', 'PortLogs'], ['Popup received message: ', msg]);
         if (msg.id !== undefined && callbacks.has(msg.id)) {
@@ -208,6 +265,10 @@ document.addEventListener('DOMContentLoaded', () => {
                     log(['TabLogs'], ['Processing update_tab_states: ', msg.data]);
                     updateTabStates(msg.data);
                     break;
+                case 'transfer_stats_update':
+                    log(['DebugLogs'], ['Processing transfer_stats_update: ', msg.stats]);
+                    updateTransferStats(msg.stats);
+                    break;
                 case 'tab_paused':
                     log(['ActionLogs', 'TabLogs'], `Processing tab_paused for tab ${msg.tabId}`);
                     tabStates.set(msg.tabId, { ...tabStates.get(msg.tabId), isPaused: true });
@@ -224,8 +285,8 @@ document.addEventListener('DOMContentLoaded', () => {
                     break;
                 case 'tab_status_updated':
                     log(['ActionLogs', 'TabLogs'], `Processing tab_status_updated for tab ${msg.tabId}`);
-                    tabStates.set(msg.tabId, { 
-                        ...tabStates.get(msg.tabId), 
+                    tabStates.set(msg.tabId, {
+                        ...tabStates.get(msg.tabId),
                         isPaused: msg.isPaused ?? tabStates.get(msg.tabId)?.isPaused,
                         status: msg.status ?? tabStates.get(msg.tabId)?.status
                     });
@@ -458,6 +519,18 @@ document.addEventListener('DOMContentLoaded', () => {
                 statusDiv.textContent = `Error: ${res?.error || 'Unknown'}`;
             }
         });
+    });
+
+    resetStatsButton.addEventListener('click', () => {
+        if (confirm('Are you sure you want to reset all transfer statistics?')) {
+            sendMessage({ action: 'reset_transfer_stats' }, (res) => {
+                if (res?.success) {
+                    log(['GeneralLogs'], 'Transfer statistics reset successfully');
+                } else {
+                    log(['ErrorLogs'], `Failed to reset transfer statistics: ${res?.error || 'Unknown'}`);
+                }
+            });
+        }
     });
 
     tabTrackingDiv.addEventListener('click', (e) => {
